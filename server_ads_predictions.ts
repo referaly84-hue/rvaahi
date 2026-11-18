@@ -1462,15 +1462,17 @@ function recordSdkS2SReward(tgId: string, blockId: string) {
   const cleanTg = String(tgId || '').replace(/[^0-9]/g, '').slice(0, 32);
   if (!cleanTg) return false;
   const cleanBlk = String(blockId || '').trim().slice(0, 64);
+  const cleanBlkBare = cleanBlk.replace(/^(int-|task-)/i, '');
   const now = Date.now();
   recentSdkS2SRewards.push({ tgId: cleanTg, blockId: cleanBlk, receivedAt: now, used: false });
   // Mark any matching active session for this user as S2S confirmed
   for (const s of adSessions.values()) {
+    const sBare = s.blockId.replace(/^(int-|task-)/i, '');
     if (
       !s.consumed &&
       s.tgId === cleanTg &&
       now - s.startedAt <= 15 * 60 * 1000 &&
-      (!cleanBlk || cleanBlk === s.blockId)
+      (!cleanBlk || cleanBlk === s.blockId || (cleanBlkBare && cleanBlkBare === sBare))
     ) {
       s.s2sConfirmed = true;
     }
@@ -1481,14 +1483,16 @@ function recordSdkS2SReward(tgId: string, blockId: string) {
 function consumeSdkS2SReward(tgId: string, blockId: string, startedAt: number): boolean {
   if (!tgId) return false;
   const now = Date.now();
+  const blockBare = String(blockId || '').replace(/^(int-|task-)/i, '');
   for (let i = recentSdkS2SRewards.length - 1; i >= 0; i--) {
     const entry = recentSdkS2SRewards[i];
+    const entryBare = String(entry.blockId || '').replace(/^(int-|task-)/i, '');
     if (
       !entry.used &&
       entry.tgId === tgId &&
       entry.receivedAt >= startedAt - 5000 &&
       now - entry.receivedAt <= 15 * 60 * 1000 &&
-      (!entry.blockId || entry.blockId === blockId)
+      (!entry.blockId || entry.blockId === blockId || (entryBare && entryBare === blockBare))
     ) {
       entry.used = true;
       return true;
@@ -1885,7 +1889,8 @@ export function verifyAndConsumeAdProof(
   adProof: string | undefined,
   expectedBlockKey: string,
   actorKey: string,
-  requireClick = false
+  requireClick = false,
+  callerRole?: string
 ): { ok: true } | { ok: false; error: string } {
   if (!adProof) return { ok: false, error: 'Необходимо просмотреть рекламу Adsgram перед выполнением действия.' };
   const s = adSessions.get(String(adProof));
@@ -1903,7 +1908,11 @@ export function verifyAndConsumeAdProof(
     adSessions.delete(s.token);
     return { ok: false, error: 'Рекламный блок Adsgram не настроен.' };
   }
-  if (s.actorKey !== actorKey) return { ok: false, error: 'Сессия рекламы принадлежит другому пользователю.' };
+  const adminClubBridge =
+    callerRole === 'admin' && s.actorKey.startsWith('admin:') && actorKey.startsWith('club:');
+  if (s.actorKey !== actorKey && !adminClubBridge) {
+    return { ok: false, error: 'Сессия рекламы принадлежит другому пользователю.' };
+  }
   if (requireClick && !s.clicked) {
     return { ok: false, error: 'Для выполнения действия необходимо полностью завершить рекламный показ.' };
   }
@@ -1933,7 +1942,7 @@ export function checkAndConsumeFriendlyRequestAd(
       error: `Достигнут лимит заявок на товарищеские матчи за этот перерыв на сборные (${FRIENDLY_BREAK_LIMIT}/${FRIENDLY_BREAK_LIMIT}).`,
     };
   }
-  const v = verifyAndConsumeAdProof(adProof, 'friendly_request', actorKey, true);
+  const v = verifyAndConsumeAdProof(adProof, 'friendly_request', actorKey, true, actorKey.startsWith('club:') ? 'admin' : undefined);
   if (!v.ok) return v;
   db.friendlyAdUsage[teamId][breakId] = used + 1;
   return { ok: true, used: used + 1, limit: FRIENDLY_BREAK_LIMIT };
@@ -1943,7 +1952,7 @@ export function checkAndConsumeFriendlyAcceptAd(
   actorKey: string,
   adProof?: string
 ): { ok: true } | { ok: false; error: string } {
-  return verifyAndConsumeAdProof(adProof, 'friendly_accept', actorKey, false);
+  return verifyAndConsumeAdProof(adProof, 'friendly_accept', actorKey, false, actorKey.startsWith('club:') ? 'admin' : undefined);
 }
 
 function extractFixtureMatchSummary(ctx: AdServerContext, f: any) {
@@ -2783,11 +2792,13 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       }
     }
 
-    const minWatchMs = blockId.toLowerCase().startsWith('task-')
-      ? 1500
-      : def.format === 'long' || def.format === 'click_long'
-        ? 4000
-        : 2500;
+    const minWatchMs = blockId.toLowerCase().startsWith('int-')
+      ? 300
+      : blockId.toLowerCase().startsWith('task-')
+        ? 1000
+        : def.format === 'long' || def.format === 'click_long'
+          ? 3000
+          : 1500;
 
     const token = 'ad_' + crypto.randomBytes(14).toString('hex');
     adSessions.set(token, {
@@ -2816,27 +2827,33 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     });
   });
 
-  app.post('/api/ads/cancel', (req, res) => {
+  app.post('/api/ads/cancel', (req: any, res) => {
     const token = String(req.body?.sessionToken || '').trim();
     if (!token) return res.json({ ok: 1 });
     const s = adSessions.get(token);
     if (s && !s.consumed) {
       const actor = resolveActor(req);
-      if (s.actorKey === actor.actorKey) {
+      if (s.actorKey === actor.actorKey || (req.me?.role === 'admin' && s.actorKey.startsWith('admin:'))) {
         adSessions.delete(token);
       }
     }
     res.json({ ok: 1 });
   });
 
-  app.post('/api/ads/complete', (req, res) => {
+  app.post('/api/ads/complete', async (req: any, res) => {
     pruneAdSessions();
     const db = ctx.getDb();
     const token = String(req.body?.sessionToken || '').trim();
     const s = adSessions.get(token);
     if (!s) return ctx.fail(res, 'Рекламная сессия не найдена или уже закрыта.');
     const actor = resolveActor(req);
-    if (s.actorKey !== actor.actorKey) return ctx.fail(res, 'Сессия не принадлежит текущему пользователю.');
+    const adminClubBridge =
+      req.me?.role === 'admin' &&
+      ((s.actorKey.startsWith('admin:') && actor.actorKey.startsWith('club:')) ||
+        (s.actorKey.startsWith('club:') && actor.actorKey.startsWith('admin:')));
+    if (s.actorKey !== actor.actorKey && !adminClubBridge) {
+      return ctx.fail(res, 'Сессия не принадлежит текущему пользователю.');
+    }
     if (s.consumed || s.verified) {
       return ctx.fail(res, 'Эта рекламная сессия уже использована. Запустите просмотр заново.');
     }
@@ -2878,23 +2895,50 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     }
 
     if (db.settings?.requireAdsgramS2S && !s.blockId.toLowerCase().startsWith('int-')) {
-      const s2sOk = !!s.s2sConfirmed || consumeSdkS2SReward(s.tgId, s.blockId, s.startedAt);
+      let s2sOk = !!s.s2sConfirmed || consumeSdkS2SReward(s.tgId, s.blockId, s.startedAt);
+      if (!s2sOk && s.tgId) {
+        // Adsgram sends the Reward URL GET request after client reward fires; wait briefly for callback delivery.
+        for (let attempt = 0; attempt < 12 && !s2sOk; attempt++) {
+          await new Promise((r) => setTimeout(r, 250));
+          s2sOk = !!s.s2sConfirmed || consumeSdkS2SReward(s.tgId, s.blockId, s.startedAt);
+        }
+      }
       if (!s2sOk) {
         adSessions.delete(token);
-        return ctx.fail(res, 'Сервер Adsgram не подтвердил просмотр (не поступил S2S Reward callback).');
+        return ctx.fail(
+          res,
+          'Сервер Adsgram не подтвердил просмотр (S2S Reward callback не поступил). Проверьте Reward URL в блоке Adsgram или отключите строгий S2S-режим в Админке.'
+        );
       }
     }
 
     s.clicked = clicked;
     s.verified = true;
-    s.verifiedAt = now;
+    s.verifiedAt = Date.now();
     res.json({ ok: 1, adProof: token, blockKey: s.blockKey, clicked: s.clicked });
   });
 
   const handleSdkS2SReward = (req: any, res: Response) => {
-    const rawTgId = req.query?.userid || req.query?.tgid || req.query?.user_id || req.query?.telegram_id || req.body?.userid || req.body?.tgid || '';
+    const rawTgId =
+      req.query?.userid ||
+      req.query?.userId ||
+      req.query?.tgid ||
+      req.query?.tgId ||
+      req.query?.user_id ||
+      req.query?.telegram_id ||
+      req.body?.userid ||
+      req.body?.userId ||
+      req.body?.tgid ||
+      '';
     const tgId = String(rawTgId).replace(/[^0-9]/g, '').slice(0, 32);
-    const blockId = String(req.query?.blockid || req.query?.block_id || req.body?.blockid || '').trim();
+    const blockId = String(
+      req.query?.blockid ||
+      req.query?.blockId ||
+      req.query?.block_id ||
+      req.body?.blockid ||
+      req.body?.blockId ||
+      ''
+    ).trim();
     if (!tgId) {
       return res.status(400).json({ ok: 0, error: 'Missing userid' });
     }
@@ -2925,7 +2969,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     if (spCdLeft > 0) {
       return ctx.fail(res, `Перерыв между рекламами у спонсора «${sp.name}»: подождите ещё ${fmtCooldownWords(spCdLeft)}.`);
     }
-    const v = verifyAndConsumeAdProof(req.body?.adProof, sp.blockKey, actor.actorKey, false);
+    const v = verifyAndConsumeAdProof(req.body?.adProof, sp.blockKey, actor.actorKey, false, req.me?.role);
     if (!v.ok) return ctx.fail(res, v.error);
 
     const credit = executeSponsorCredit(ctx, req.tid, sp);
@@ -2948,7 +2992,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     if (rfsCdLeft > 0) {
       return ctx.fail(res, `Перерыв между рекламами РФС: подождите ещё ${fmtCooldownWords(rfsCdLeft)}.`);
     }
-    const v = verifyAndConsumeAdProof(req.body?.adProof, 'rfs_bonus', actor.actorKey, false);
+    const v = verifyAndConsumeAdProof(req.body?.adProof, 'rfs_bonus', actor.actorKey, false, req.me?.role);
     if (!v.ok) return ctx.fail(res, v.error);
 
     ctx.ensureInitialBudgets();

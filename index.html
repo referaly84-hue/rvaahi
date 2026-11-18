@@ -8,7 +8,7 @@
 <meta property="og:title" content="Вирт РПЛ и Кубок России — Симулятор с Жеребьевкой" />
 <meta property="og:description" content="Интерактивный симулятор футбола с жеребьевкой, спонсорами Adsgram, прогнозами на тур, профилями владельцев и сборной России." />
 <meta property="og:type" content="website" />
-<script src="https://sad.adsgram.ai/js/sad.min.js" async></script>
+<script src="https://sad.adsgram.ai/js/sad.min.js"></script>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
   try {
@@ -4344,7 +4344,8 @@ function paintMatch() {
       btn.disabled = true;
       try {
         // 1. Сначала реклама Adsgram
-        const adRes = await window.__RPL_EXT__?.runAdsgramBlock?.(
+        const ext = await ensureExt();
+        const adRes = await ext.runAdsgramBlock(
           'interview_ask',
           `Вопрос игроку: ${p.name}`,
           'Сначала просмотрите рекламу Adsgram, затем ваш вопрос пройдёт проверку и будет передан игроку в микст-зону.'
@@ -7150,7 +7151,12 @@ async function pgClub(app) {
       </div>`;
     cb.querySelectorAll('[data-fr-ok]').forEach(b => b.onclick = async () => {
       const ext = await ensureExt();
-      const adRes = await ext.runAdsgramBlock('friendly_accept', 'Принятие приглашения на товарищеский матч', 'Для подтверждения участия клубу РПЛ необходимо просмотреть рекламу.');
+      const adRes = await ext.runAdsgramBlock(
+        'friendly_accept',
+        'Принятие приглашения на товарищеский матч',
+        'Для подтверждения участия клубу РПЛ необходимо просмотреть рекламу.',
+        { teamId: CLUB_TID }
+      );
       if (!adRes) return;
       const r = await act(() => api('/club/friendly/respond', withT({ requestId: b.dataset.frOk, action: 'approve', adProof: adRes.adProof })), 'Приглашение принято');
       if (r) pgClub(app);
@@ -7186,7 +7192,12 @@ async function pgClub(app) {
       cb.querySelectorAll('[data-fr-b]').forEach(b => b.onclick = () => { $('#fr_budget').value = b.dataset.frB; });
       $('#fr_send').onclick = async () => {
         const ext = await ensureExt();
-        const adRes = await ext.runAdsgramBlock('friendly_request', 'Заявка на товарищеский матч', 'Посмотрите большую рекламу и обязательно нажмите на рекламное предложение.');
+        const adRes = await ext.runAdsgramBlock(
+          'friendly_request',
+          'Заявка на товарищеский матч',
+          'Посмотрите большую рекламу и обязательно нажмите на рекламное предложение.',
+          { teamId: CLUB_TID }
+        );
         if (!adRes) return;
         const r = await act(() => api('/club/friendly/request', withT({
           opponentId: $('#fr_opp').value,

@@ -28,9 +28,11 @@ declare global {
       linkedTeamId?: string | null;
     } | null;
     Adsgram?: {
-      init: (opts: { blockId: string }) => {
+      init: (opts: { blockId: string; debug?: boolean; debugConsole?: boolean }) => {
         show: () => Promise<{ done?: boolean; error?: boolean; state?: string; description?: string }>;
         addEventListener?: (event: string, cb: (e?: any) => void) => void;
+        removeEventListener?: (event: string, cb: (e?: any) => void) => void;
+        destroy?: () => void;
       };
     };
     Telegram?: any;
@@ -859,9 +861,14 @@ function ensureExtStyles() {
       .pred-line-4{ grid-template-columns:repeat(2,minmax(0,1fr)); }
     }
     .rpl-adsgram-task{
-      --adsgram-task-font-size:14px;
-      --adsgram-task-button-width:110px;
+      --adsgram-task-font-size:15px;
+      --adsgram-task-icon-size:44px;
+      --adsgram-task-icon-title-gap:12px;
+      --adsgram-task-icon-border-radius:10px;
+      --adsgram-task-button-width:96px;
       display:block;
+      width:100%;
+      box-sizing:border-box;
       background:linear-gradient(155deg,#0d2f21 0%,#144530 100%);
       color:#fff;
       padding:14px 16px;
@@ -1016,30 +1023,68 @@ function isRealConfiguredSdkBlockId(blockId: string): boolean {
   return /^\d+$/.test(v) || /^task-\d+$/i.test(v) || /^int-\d+$/i.test(v);
 }
 
-async function waitForAdsgramSdk(timeoutMs = 1500): Promise<boolean> {
-  if (typeof window.Adsgram?.init === 'function') return true;
+async function waitForAdsgramSdk(timeoutMs = 4500): Promise<boolean> {
+  if (typeof window.Adsgram?.init === 'function' || customElements?.get('adsgram-task')) return true;
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     await new Promise((r) => setTimeout(r, 120));
-    if (typeof window.Adsgram?.init === 'function') return true;
+    if (typeof window.Adsgram?.init === 'function' || customElements?.get('adsgram-task')) return true;
   }
-  return typeof window.Adsgram?.init === 'function';
+  return typeof window.Adsgram?.init === 'function' || !!customElements?.get('adsgram-task');
+}
+
+function formatAdsgramErrMsg(raw: any, fallback: string): string {
+  const s = String(raw || '').trim();
+  if (!s) return fallback;
+  if (/There are currently no ads to display/i.test(s)) {
+    return 'Adsgram: сейчас нет доступных рекламных объявлений для показа. Попробуйте чуть позже.';
+  }
+  if (/Unable to retrieve launch parameters|open your app in Telegram/i.test(s)) {
+    return 'Adsgram: реклама работает только при запуске игры внутри Telegram Mini App.';
+  }
+  if (/Platform App url.*not equal/i.test(s)) {
+    return `Adsgram: URL мини-приложения не совпадает с настройками платформы (${s}).`;
+  }
+  if (/is not active/i.test(s)) {
+    return `Adsgram: рекламный блок не активен или проходит модерацию (${s}).`;
+  }
+  if (/is not found/i.test(s)) {
+    return `Adsgram: рекламный блок не найден (${s}). Проверьте Block ID в Админке.`;
+  }
+  if (/wrong prefix|should starts with/i.test(s)) {
+    return `Adsgram: неверный тип/префикс Block ID (${s}). Проверьте формат ID (число / int-... / task-...).`;
+  }
+  if (/Session.*too old|restart the app/i.test(s)) {
+    return 'Adsgram: сессия устарела — перезапустите Telegram Mini App.';
+  }
+  if (/several ads in a row/i.test(s)) {
+    return 'Adsgram: подождите пару секунд перед следующим показом.';
+  }
+  if (/skipped/i.test(s)) {
+    return 'Реклама пропущена — просмотр не засчитан.';
+  }
+  return s;
 }
 
 /**
- * Executes an Adsgram ad block with strict real SDK verification:
- * - Never fakes an ad view when blocks are unconfigured or Adsgram SDK is unavailable.
- * - Verifies ShowPromiseResult.done === true && !error and confirms completion on server.
+ * Executes an Adsgram ad block (Rewarded, Interstitial int-*, or Task task-*)
+ * strictly matching the official Adsgram SDK docs.
  */
 export async function runAdsgramBlock(
   blockKey: string,
   title: string,
-  subtitle?: string
+  subtitle?: string,
+  opts?: { teamId?: string }
 ): Promise<{ adProof: string; blockKey: string; clicked: boolean } | null> {
   const { api, e, toast, modal } = B();
+  const wa = window.Telegram?.WebApp;
+  const tgInitData = typeof wa?.initData === 'string' ? wa.initData : '';
+  const tgUser = wa?.initDataUnsafe?.user || null;
+  const teamIdParam = opts?.teamId ? { teamId: opts.teamId } : {};
+
   let session: any;
   try {
-    session = await api('/ads/start', { blockKey });
+    session = await api('/ads/start', { blockKey, ...teamIdParam, tgInitData, tgUser });
   } catch (err: any) {
     toast(err?.message || 'Не удалось запустить рекламный блок Adsgram', true);
     return null;
@@ -1049,7 +1094,7 @@ export async function runAdsgramBlock(
   const sessionToken = String(session?.sessionToken || '').trim();
   const cancelSession = () => {
     if (sessionToken) {
-      api('/ads/cancel', { sessionToken }).catch(() => {});
+      api('/ads/cancel', { sessionToken, ...teamIdParam }).catch(() => {});
     }
   };
 
@@ -1059,22 +1104,29 @@ export async function runAdsgramBlock(
     return null;
   }
 
-  const sdkReady = await waitForAdsgramSdk(1800);
+  const sdkReady = await waitForAdsgramSdk(4500);
   const isTaskBlock = /^task-\d+$/i.test(blockId);
+  const isInterstitialBlock = /^int-\d+$/i.test(blockId);
 
   if (isTaskBlock) {
-    if (!sdkReady && !customElements?.get('adsgram-task')) {
+    if (!customElements?.get('adsgram-task') && !sdkReady) {
       cancelSession();
       toast('Рекламный SDK Adsgram не загружен. Отключите блокировщик рекламы или откройте игру в Telegram Mini App.', true);
       return null;
     }
+
     return new Promise((resolve) => {
       let resolved = false;
       let observer: MutationObserver | null = null;
+      let watchdogTimer: any = null;
+      let countdownTimer: any = null;
+
       const finish = (val: any) => {
         if (resolved) return;
         resolved = true;
         if (observer) observer.disconnect();
+        if (watchdogTimer) clearTimeout(watchdogTimer);
+        if (countdownTimer) clearInterval(countdownTimer);
         resolve(val);
       };
 
@@ -1085,14 +1137,10 @@ export async function runAdsgramBlock(
           </div>
           <h3 style="margin:0 0 4px;font-size:17px">${e(title)}</h3>
           ${subtitle ? `<div class="small muted" style="margin-bottom:8px">${e(subtitle)}</div>` : ''}
-          <adsgram-task data-block-id="${e(blockId)}" class="rpl-adsgram-task" id="rpl_adsgram_task_el">
-            <p slot="reward" class="rpl-task-reward">Награда</p>
-            <div slot="button" class="rpl-task-btn">Перейти</div>
-            <div slot="claim" class="rpl-task-btn claim">Забрать</div>
-            <div slot="done" class="rpl-task-btn done">Готово</div>
-          </adsgram-task>
-          <div id="rpl_task_err" class="small" style="display:none;color:#b91c1c;margin-bottom:8px"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:6px">
+          <div id="rpl_task_mount"></div>
+          <div id="rpl_task_err" class="small" style="display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:9px 11px;border-radius:8px;margin-bottom:10px;line-height:1.45"></div>
+          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:6px">
+            <button type="button" id="rpl_task_retry" class="btn alt sm" style="display:none">Повторить</button>
             <button type="button" id="rpl_task_cancel" class="btn alt sm">Закрыть</button>
           </div>
         </div>
@@ -1100,54 +1148,150 @@ export async function runAdsgramBlock(
 
       modal(html, (el, close) => {
         const closeModal = typeof close === 'function' ? close : () => el.remove();
-        const taskEl = el.querySelector('#rpl_adsgram_task_el') as HTMLElement | null;
+        const mountBox = el.querySelector('#rpl_task_mount') as HTMLElement | null;
         const errBox = el.querySelector('#rpl_task_err') as HTMLElement | null;
+        const retryBtn = el.querySelector('#rpl_task_retry') as HTMLButtonElement | null;
         const cancelBtn = el.querySelector('#rpl_task_cancel') as HTMLButtonElement | null;
 
-        const failClose = (msg: string) => {
-          cancelSession();
+        const showTaskStatus = (msg: string, showRetry = true) => {
           if (errBox) {
             errBox.textContent = msg;
             errBox.style.display = 'block';
           }
-          toast(msg, true);
-          closeModal();
-          finish(null);
+          if (retryBtn) {
+            retryBtn.style.display = showRetry ? 'inline-flex' : 'none';
+          }
         };
 
-        if (!taskEl) {
-          failClose('Не удалось инициализировать задание Adsgram.');
-          return;
-        }
-
-        taskEl.addEventListener('reward', async () => {
-          try {
-            const completed = await api('/ads/complete', {
-              sessionToken,
-              clicked: true,
-              sdkCompleted: true,
-              done: true,
-              error: false,
-              state: 'task_reward',
-              description: '',
-              rewardEventFired: true,
-            });
-            closeModal();
-            finish({ adProof: completed.adProof, blockKey, clicked: !!completed.clicked });
-          } catch (err: any) {
-            failClose(err?.message || 'Сервер не подтвердил выполнение задания Adsgram.');
+        const clearTaskStatus = () => {
+          if (errBox) {
+            errBox.textContent = '';
+            errBox.style.display = 'none';
           }
-        });
+          if (retryBtn) retryBtn.style.display = 'none';
+        };
 
-        taskEl.addEventListener('onBannerNotFound', () => {
-          failClose('Рекламное задание Adsgram сейчас не найдено. Попробуйте чуть позже.');
-        });
-        taskEl.addEventListener('onError', (ev: any) => {
-          failClose(String(ev?.detail?.description || ev?.description || 'Ошибка загрузки блока Adsgram Task.'));
-        });
-        taskEl.addEventListener('onTooLongSession', () => {
-          failClose('Срок сессии рекламного задания истёк. Попробуйте снова.');
-        });
+        const mountTaskElement = () => {
+          if (!mountBox) return;
+          clearTaskStatus();
+          if (watchdogTimer) clearTimeout(watchdogTimer);
+          if (countdownTimer) clearInterval(countdownTimer);
+          mountBox.innerHTML = '';
+
+          if (!customElements?.get('adsgram-task')) {
+            showTaskStatus('Веб-компонент <adsgram-task> не зарегистрирован скриптом Adsgram.', true);
+            return;
+          }
+
+          const taskEl = document.createElement('adsgram-task');
+          taskEl.setAttribute('data-block-id', blockId);
+          taskEl.className = 'rpl-adsgram-task';
+          taskEl.id = 'rpl_adsgram_task_el';
+          taskEl.innerHTML = `
+            <p slot="reward" class="rpl-task-reward">Награда</p>
+            <div slot="button" class="rpl-task-btn">Перейти</div>
+            <div slot="claim" class="rpl-task-btn claim">Забрать</div>
+            <div slot="done" class="rpl-task-btn done">Готово</div>
+          `;
+
+          let taskEventSeen = false;
+
+          // Attach ALL listeners BEFORE appending to live DOM so synchronous connectedCallback events are never missed.
+          taskEl.addEventListener('reward', async () => {
+            taskEventSeen = true;
+            if (watchdogTimer) clearTimeout(watchdogTimer);
+            if (countdownTimer) clearInterval(countdownTimer);
+            try {
+              const completed = await api('/ads/complete', {
+                sessionToken,
+                ...teamIdParam,
+                clicked: true,
+                sdkCompleted: true,
+                done: true,
+                error: false,
+                state: 'task_reward',
+                description: '',
+                rewardEventFired: true,
+              });
+              closeModal();
+              finish({ adProof: completed.adProof, blockKey, clicked: !!completed.clicked });
+            } catch (err: any) {
+              const msg = err?.message || 'Сервер не подтвердил выполнение задания Adsgram.';
+              showTaskStatus(msg, false);
+              toast(msg, true);
+            }
+          });
+
+          taskEl.addEventListener('onBannerNotFound', () => {
+            taskEventSeen = true;
+            if (watchdogTimer) clearTimeout(watchdogTimer);
+            const perfNow = typeof performance !== 'undefined' ? performance.now() : 120000;
+            const coldLeftSec = perfNow < 120000 ? Math.ceil((120000 - perfNow) / 1000) : 0;
+            if (coldLeftSec > 2 && tgInitData) {
+              let left = coldLeftSec;
+              showTaskStatus(
+                `Adsgram проверяет свежесть сессии Mini App — задание автоматически подгрузится через ${left} сек (можно нажать «Повторить»).`,
+                true
+              );
+              countdownTimer = setInterval(() => {
+                left -= 1;
+                if (left > 0 && !resolved && document.body.contains(el)) {
+                  if (errBox) {
+                    errBox.textContent = `Adsgram проверяет свежесть сессии Mini App — задание автоматически подгрузится через ${left} сек (можно нажать «Повторить»).`;
+                  }
+                } else {
+                  clearInterval(countdownTimer);
+                }
+              }, 1000);
+            } else {
+              showTaskStatus(
+                'Задание Adsgram сейчас не найдено (нет активных кампаний или в платформе Adsgram создано больше 1 Task-блока).',
+                true
+              );
+            }
+          });
+
+          taskEl.addEventListener('onError', (ev: any) => {
+            taskEventSeen = true;
+            if (watchdogTimer) clearTimeout(watchdogTimer);
+            const detail = ev?.detail && typeof ev.detail === 'object' ? ev.detail.description : ev?.detail;
+            const msg = formatAdsgramErrMsg(
+              detail || ev?.description,
+              `Не удалось загрузить задание Adsgram (${blockId}).`
+            );
+            showTaskStatus(msg, true);
+          });
+
+          taskEl.addEventListener('onTooLongSession', () => {
+            taskEventSeen = true;
+            if (watchdogTimer) clearTimeout(watchdogTimer);
+            showTaskStatus('Сессия слишком долгая — перезапустите Telegram Mini App для получения заданий Adsgram.', false);
+          });
+
+          taskEl.addEventListener('onFastReturn', () => {
+            showTaskStatus('Вы слишком быстро вернулись — перейдите по заданию и оставайтесь там несколько секунд.', false);
+          });
+
+          mountBox.appendChild(taskEl);
+
+          // In sad.min.js, non-400 Task errors (e.g. NoUserData outside Telegram) do not emit onError/onBannerNotFound.
+          if (!tgInitData) {
+            watchdogTimer = setTimeout(() => {
+              if (!resolved && !taskEventSeen && document.body.contains(el)) {
+                showTaskStatus(
+                  'Блок Adsgram Task работает только внутри Telegram Mini App (в обычном браузере Telegram не передаёт параметры запуска).',
+                  true
+                );
+              }
+            }, 2200);
+          }
+        };
+
+        mountTaskElement();
+
+        if (retryBtn) {
+          retryBtn.onclick = () => mountTaskElement();
+        }
 
         if (cancelBtn) {
           cancelBtn.onclick = () => {
@@ -1179,7 +1323,7 @@ export async function runAdsgramBlock(
     controller = window.Adsgram.init({ blockId });
   } catch (err: any) {
     cancelSession();
-    toast(err?.message || 'Не удалось инициализировать блок Adsgram', true);
+    toast(formatAdsgramErrMsg(err?.description || err?.message, 'Не удалось инициализировать блок Adsgram'), true);
     return null;
   }
 
@@ -1187,34 +1331,76 @@ export async function runAdsgramBlock(
   let bannerNotFound = false;
   let skipped = false;
   let rewardEventFired = false;
+  let completeEventFired = false;
+
+  const onBannerNotFound = () => {
+    bannerNotFound = true;
+    eventError = 'Реклама Adsgram сейчас не подобрана для показа. Попробуйте чуть позже.';
+  };
+  const onError = (ev: any) => {
+    const desc = String(ev?.description || '').trim();
+    if (desc) eventError = desc;
+  };
+  const onSkip = () => {
+    skipped = true;
+  };
+  const onReward = () => {
+    rewardEventFired = true;
+  };
+  const onComplete = () => {
+    completeEventFired = true;
+  };
+  const onNonStopShow = () => {
+    eventError = 'Adsgram: подождите пару секунд перед следующим показом рекламы.';
+  };
+  const onTooLongSession = () => {
+    eventError = 'Adsgram: сессия устарела — перезапустите Telegram Mini App.';
+  };
 
   try {
     if (typeof controller?.addEventListener === 'function') {
-      controller.addEventListener('onBannerNotFound', () => {
-        bannerNotFound = true;
-        eventError = 'Реклама Adsgram сейчас не подобрана для показа. Попробуйте чуть позже.';
-      });
-      controller.addEventListener('onError', (ev: any) => {
-        eventError = String(ev?.description || 'Ошибка показа рекламы Adsgram.');
-      });
-      controller.addEventListener('onSkip', () => {
-        skipped = true;
-      });
-      controller.addEventListener('onReward', () => {
-        rewardEventFired = true;
-      });
+      controller.addEventListener('onBannerNotFound', onBannerNotFound);
+      controller.addEventListener('onError', onError);
+      controller.addEventListener('onSkip', onSkip);
+      controller.addEventListener('onReward', onReward);
+      controller.addEventListener('onComplete', onComplete);
+      controller.addEventListener('onNonStopShow', onNonStopShow);
+      controller.addEventListener('onTooLongSession', onTooLongSession);
     }
   } catch {}
 
+  const cleanupListeners = () => {
+    try {
+      if (typeof controller?.removeEventListener === 'function') {
+        controller.removeEventListener('onBannerNotFound', onBannerNotFound);
+        controller.removeEventListener('onError', onError);
+        controller.removeEventListener('onSkip', onSkip);
+        controller.removeEventListener('onReward', onReward);
+        controller.removeEventListener('onComplete', onComplete);
+        controller.removeEventListener('onNonStopShow', onNonStopShow);
+        controller.removeEventListener('onTooLongSession', onTooLongSession);
+      }
+    } catch {}
+  };
+
   try {
     const res = await controller.show();
-    const isDone = Boolean(res && res.done === true && !res.error && !bannerNotFound && !skipped);
+    // Per official Adsgram docs:
+    // - Rewarded show() resolves on full view (onReward, done: true).
+    // - Interstitial (int-*) show() resolves on full view OR close (onComplete, done: true).
+    const isDone = Boolean(
+      !res?.error &&
+      res?.done !== false &&
+      !bannerNotFound &&
+      (isInterstitialBlock ? (completeEventFired || res?.done === true || res === undefined) : !skipped)
+    );
     if (!isDone) {
       cancelSession();
       toast(
-        eventError ||
-          res?.description ||
-          (skipped ? 'Реклама пропущена — просмотр не засчитан.' : 'Реклама Adsgram не была досмотрена до конца.'),
+        formatAdsgramErrMsg(
+          eventError || res?.description,
+          skipped ? 'Реклама пропущена — просмотр не засчитан.' : 'Реклама Adsgram не была досмотрена до конца.'
+        ),
         true
       );
       return null;
@@ -1222,19 +1408,28 @@ export async function runAdsgramBlock(
 
     const completed = await api('/ads/complete', {
       sessionToken,
+      ...teamIdParam,
+      tgInitData,
+      tgUser,
       clicked: true,
       sdkCompleted: true,
       done: true,
       error: false,
-      state: String(res?.state || ''),
+      state: String(res?.state || (isInterstitialBlock ? 'interstitial_complete' : 'reward')),
       description: String(res?.description || ''),
-      rewardEventFired,
+      rewardEventFired: rewardEventFired || completeEventFired,
     });
     return { adProof: completed.adProof, blockKey, clicked: !!completed.clicked };
   } catch (err: any) {
     cancelSession();
-    toast(eventError || err?.description || err?.message || 'Просмотр рекламы Adsgram не выполнен или отменён', true);
+    const rawMsg = err?.description || err?.message || eventError || '';
+    toast(
+      formatAdsgramErrMsg(rawMsg, 'Просмотр рекламы Adsgram не выполнен или отменён.'),
+      true
+    );
     return null;
+  } finally {
+    cleanupListeners();
   }
 }
 
@@ -1406,17 +1601,27 @@ export function renderClubSponsorsTab(cb: HTMLElement, c: any, reloadClub: () =>
 
   cb.querySelectorAll('[data-sp-ask]').forEach((btn) => {
     (btn as HTMLButtonElement).onclick = async () => {
-      const sponsorId = (btn as HTMLElement).dataset.spAsk!;
-      const blockKey = (btn as HTMLElement).dataset.spBlock!;
-      const spName = (btn as HTMLElement).dataset.spName!;
-      const adRes = await runAdsgramBlock(blockKey, `Запрос к спонсору «${spName}»`, 'После просмотра спонсор рассмотрит заявку (вероятность одобрения 95/5).');
-      if (!adRes) return;
+      const bEl = btn as HTMLButtonElement;
+      if (bEl.disabled) return;
+      bEl.disabled = true;
       try {
+        const sponsorId = bEl.dataset.spAsk!;
+        const blockKey = bEl.dataset.spBlock!;
+        const spName = bEl.dataset.spName!;
+        const adRes = await runAdsgramBlock(
+          blockKey,
+          `Запрос к спонсору «${spName}»`,
+          'После просмотра спонсор рассмотрит заявку (вероятность одобрения 95/5).',
+          teamParam
+        );
+        if (!adRes) return;
         const res = await api('/club/sponsors/request', { ...teamParam, sponsorId, adProof: adRes.adProof });
         toast(res.message, !res.approved);
         reloadClub();
       } catch (err: any) {
         toast(err?.message || 'Ошибка обращения к спонсору', true);
+      } finally {
+        if (document.body.contains(bEl)) bEl.disabled = false;
       }
     };
   });
@@ -1424,14 +1629,23 @@ export function renderClubSponsorsTab(cb: HTMLElement, c: any, reloadClub: () =>
   const rfsBtn = document.getElementById('sp_rfs_btn') as HTMLButtonElement | null;
   if (rfsBtn && !rfsBtn.disabled) {
     rfsBtn.onclick = async () => {
-      const adRes = await runAdsgramBlock('rfs_bonus', 'Бонус от РФС (+€1 000)', `Премиум-показ после выполнения ${sp.totalRequired}/${sp.totalRequired} реклам спонсоров.`);
-      if (!adRes) return;
+      if (rfsBtn.disabled) return;
+      rfsBtn.disabled = true;
       try {
+        const adRes = await runAdsgramBlock(
+          'rfs_bonus',
+          'Бонус от РФС (+€1 000)',
+          `Премиум-показ после выполнения ${sp.totalRequired}/${sp.totalRequired} реклам спонсоров.`,
+          teamParam
+        );
+        if (!adRes) return;
         const res = await api('/club/sponsors/rfs-claim', { ...teamParam, adProof: adRes.adProof });
         toast(res.message);
         reloadClub();
       } catch (err: any) {
         toast(err?.message || 'Ошибка получения бонуса РФС', true);
+      } finally {
+        if (document.body.contains(rfsBtn)) rfsBtn.disabled = false;
       }
     };
   }
@@ -2229,20 +2443,25 @@ function renderPredictionsContent(app: HTMLElement, data: any) {
 
   app.querySelectorAll('[data-earn-coins]').forEach((b) => {
     (b as HTMLButtonElement).onclick = async () => {
-      const blockKey = (b as HTMLElement).dataset.earnCoins!;
-      const label = blockKey === 'coins_short'
-        ? '+1 монета (5 сек)'
-        : blockKey === 'coins_banner'
-          ? '+2 монеты (баннер)'
-          : '+3 монеты (30 сек)';
-      const adRes = await runAdsgramBlock(blockKey, `Пополнение баланса: ${label}`);
-      if (!adRes) return;
+      const btn = b as HTMLButtonElement;
+      if (btn.disabled) return;
+      btn.disabled = true;
       try {
+        const blockKey = btn.dataset.earnCoins!;
+        const label = blockKey === 'coins_short'
+          ? '+1 монета (5 сек)'
+          : blockKey === 'coins_banner'
+            ? '+2 монеты (баннер)'
+            : '+3 монеты (30 сек)';
+        const adRes = await runAdsgramBlock(blockKey, `Пополнение баланса: ${label}`);
+        if (!adRes) return;
         const res = await api('/predictions/earn-coins', { blockKey, adProof: adRes.adProof });
         toast(res.message);
         renderPredictionsPage(app, { forceReload: true, silent: true });
       } catch (err: any) {
         toast(err?.message || 'Ошибка начисления монет', true);
+      } finally {
+        if (document.body.contains(btn)) btn.disabled = false;
       }
     };
   });
@@ -2744,7 +2963,7 @@ export function renderAdminAdsSettingsHtml(ov: any, e: (s: any) => string): stri
   return `
     <div class="panel" style="margin-top:16px">
       <h3>Рекламная сеть Adsgram (отдельный Block ID для каждой кнопки)</h3>
-      <p class="small muted" style="margin:0 0 10px">Укажите реальные Block ID из личного кабинета Adsgram (числовой ID, <code>int-12345</code> или <code>task-12345</code>). Блоки со строковыми заглушками отключены и не засчитываются как просмотр.</p>
+      <p class="small muted" style="margin:0 0 10px">Укажите реальные Block ID из личного кабинета Adsgram: числовой ID (<code>60557</code> — Reward), <code>int-12345</code> (Interstitial) или <code>task-12345</code> (Task). По правилам Adsgram на одно Mini App допускается не более 1 блока типа Task — один и тот же <code>task-...</code> можно указать в обоих полях для баннерных заданий.</p>
       <div class="grid g2">
         ${defs.map((d: any) => {
           const curVal = String(blocks[d.key] || d.defaultBlockId);
@@ -2763,7 +2982,7 @@ export function renderAdminAdsSettingsHtml(ov: any, e: (s: any) => string): stri
       <div style="margin-top:14px;padding:12px 14px;background:var(--soft);border:1px solid var(--line);border-radius:10px">
         <div style="font-weight:700;font-size:13.5px;margin-bottom:6px">Серверная проверка Mini App SDK (S2S Reward URL)</div>
         <div class="small muted" style="line-height:1.5;margin-bottom:8px">
-          <b>SDK Reward URL</b> (необязательно, для максимальной защиты вставьте в поле Reward URL в блоке Adsgram):<br>
+          <b>SDK Reward URL</b> (необязательно; включайте галочку ниже только если прописали этот URL во всех Reward-блоках в кабинете Adsgram):<br>
           <code style="user-select:all;word-break:break-all">${e(sdkRewardUrl)}</code>
         </div>
         <label class="small" style="display:flex;align-items:center;gap:8px;cursor:pointer">
@@ -2806,3 +3025,7 @@ window.__RPL_EXT__ = {
   collectAdminAdsBlocks,
   collectAdminAdsRequireS2S,
 };
+
+if (typeof window !== 'undefined' && (window.Telegram?.WebApp?.initData || window.Telegram?.WebApp?.initDataUnsafe?.user?.id)) {
+  syncTelegramAuth().catch(() => {});
+}
