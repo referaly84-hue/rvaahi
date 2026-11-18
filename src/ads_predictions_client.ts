@@ -901,6 +901,89 @@ function ensureExtStyles() {
       cursor:default;
       opacity:.85;
     }
+    .adcab-hero{
+      background:linear-gradient(135deg,#0b281c 0%,#144530 100%);
+      color:#ffffff;
+      border-radius:14px;
+      padding:18px 20px;
+      margin-bottom:14px;
+      border:1px solid #1d583e;
+      display:flex;
+      flex-wrap:wrap;
+      align-items:center;
+      justify-content:space-between;
+      gap:14px;
+    }
+    .adcab-hero h2{margin:0 0 4px;font:700 20px Unbounded,sans-serif;color:#fff}
+    .adcab-hero-sub{font-size:13px;color:#cde2d4;line-height:1.45;max-width:680px}
+    .adcab-kpis{
+      display:grid;
+      grid-template-columns:repeat(6,minmax(0,1fr));
+      gap:10px;
+      margin-bottom:14px;
+    }
+    .adcab-kpi{
+      background:#ffffff;
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:12px 13px;
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      font-variant-numeric:tabular-nums;
+    }
+    .adcab-kpi-lbl{font-size:11.5px;color:var(--muted);font-weight:600}
+    .adcab-kpi-val{font:700 19px Unbounded,sans-serif;color:#0d2f21;line-height:1.15}
+    .adcab-kpi-sub{font-size:11.5px;color:#4b6456}
+    .adcab-fmt-grid{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:12px;
+      margin-bottom:14px;
+    }
+    .adcab-subtabs{
+      display:flex;
+      gap:6px;
+      flex-wrap:wrap;
+      margin-bottom:14px;
+      padding-bottom:8px;
+      border-bottom:2px solid var(--line);
+    }
+    .adcab-subtabs button{
+      background:#f4f8f5;
+      border:1px solid #d4e0d8;
+      padding:7px 13px;
+      border-radius:8px;
+      cursor:pointer;
+      font-weight:600;
+      font-size:13px;
+      color:#3d5347;
+      transition:all .12s;
+    }
+    .adcab-subtabs button:hover{border-color:#15803d;color:#0d2f21}
+    .adcab-subtabs button.on{background:#0d2f21;border-color:#0d2f21;color:#fff}
+    .adcab-badge{
+      display:inline-flex;
+      align-items:center;
+      gap:4px;
+      padding:2px 8px;
+      border-radius:6px;
+      font-size:11.5px;
+      font-weight:700;
+      white-space:nowrap;
+    }
+    .adcab-badge.ok{background:#dcfce7;color:#166534;border:1px solid #86efac}
+    .adcab-badge.warn{background:#fef3c7;color:#92400e;border:1px solid #fde68a}
+    .adcab-badge.err{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
+    .adcab-badge.info{background:#e0f2fe;color:#075985;border:1px solid #bae6fd}
+    .adcab-badge.muted{background:#f1f5f9;color:#475569;border:1px solid #cbd5e1}
+    @media (max-width:1100px){
+      .adcab-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}
+    }
+    @media (max-width:760px){
+      .adcab-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .adcab-fmt-grid{grid-template-columns:1fr}
+    }
   `;
 }
 
@@ -1092,14 +1175,17 @@ export async function runAdsgramBlock(
 
   const blockId = String(session?.blockId || '').trim();
   const sessionToken = String(session?.sessionToken || '').trim();
-  const cancelSession = () => {
+  const cancelSession = (reason = 'cancel', detail = '') => {
     if (sessionToken) {
-      api('/ads/cancel', { sessionToken, ...teamIdParam }).catch(() => {});
+      api('/ads/cancel', { sessionToken, ...teamIdParam, reason, detail }).catch(() => {});
     }
+  };
+  const reportClientEvent = (kind: 'error' | 'cancel' | 'skip', detail: string) => {
+    api('/ads/client-event', { blockKey, blockId, kind, detail, ...teamIdParam }).catch(() => {});
   };
 
   if (!isRealConfiguredSdkBlockId(blockId)) {
-    cancelSession();
+    cancelSession('error', `Некорректный Block ID: ${blockId || blockKey}`);
     toast(`Рекламный блок «${blockId || blockKey}» ещё не настроен. Укажите реальный Block ID в Админке.`, true);
     return null;
   }
@@ -1110,7 +1196,7 @@ export async function runAdsgramBlock(
 
   if (isTaskBlock) {
     if (!customElements?.get('adsgram-task') && !sdkReady) {
-      cancelSession();
+      cancelSession('sdk_error', 'SDK <adsgram-task> не загружен (блокировщик или вне Telegram)');
       toast('Рекламный SDK Adsgram не загружен. Отключите блокировщик рекламы или откройте игру в Telegram Mini App.', true);
       return null;
     }
@@ -1227,6 +1313,12 @@ export async function runAdsgramBlock(
             if (watchdogTimer) clearTimeout(watchdogTimer);
             const perfNow = typeof performance !== 'undefined' ? performance.now() : 120000;
             const coldLeftSec = perfNow < 120000 ? Math.ceil((120000 - perfNow) / 1000) : 0;
+            reportClientEvent(
+              'error',
+              coldLeftSec > 2 && tgInitData
+                ? `Task onBannerNotFound (прогрев Mini App ~${coldLeftSec}с)`
+                : 'Task onBannerNotFound: нет активных кампаний'
+            );
             if (coldLeftSec > 2 && tgInitData) {
               let left = coldLeftSec;
               showTaskStatus(
@@ -1255,6 +1347,8 @@ export async function runAdsgramBlock(
             taskEventSeen = true;
             if (watchdogTimer) clearTimeout(watchdogTimer);
             const detail = ev?.detail && typeof ev.detail === 'object' ? ev.detail.description : ev?.detail;
+            const rawDetail = String(detail || ev?.description || 'Task onError');
+            reportClientEvent('error', `Task: ${rawDetail}`);
             const msg = formatAdsgramErrMsg(
               detail || ev?.description,
               `Не удалось загрузить задание Adsgram (${blockId}).`
@@ -1265,10 +1359,12 @@ export async function runAdsgramBlock(
           taskEl.addEventListener('onTooLongSession', () => {
             taskEventSeen = true;
             if (watchdogTimer) clearTimeout(watchdogTimer);
+            reportClientEvent('error', 'Task onTooLongSession: сессия устарела');
             showTaskStatus('Сессия слишком долгая — перезапустите Telegram Mini App для получения заданий Adsgram.', false);
           });
 
           taskEl.addEventListener('onFastReturn', () => {
+            reportClientEvent('cancel', 'Task onFastReturn: быстрый возврат без выполнения');
             showTaskStatus('Вы слишком быстро вернулись — перейдите по заданию и оставайтесь там несколько секунд.', false);
           });
 
@@ -1278,6 +1374,7 @@ export async function runAdsgramBlock(
           if (!tgInitData) {
             watchdogTimer = setTimeout(() => {
               if (!resolved && !taskEventSeen && document.body.contains(el)) {
+                reportClientEvent('error', 'Task открыт вне Telegram Mini App (нет initData)');
                 showTaskStatus(
                   'Блок Adsgram Task работает только внутри Telegram Mini App (в обычном браузере Telegram не передаёт параметры запуска).',
                   true
@@ -1295,7 +1392,7 @@ export async function runAdsgramBlock(
 
         if (cancelBtn) {
           cancelBtn.onclick = () => {
-            cancelSession();
+            cancelSession('cancel', 'Закрыто окно Task-задания');
             closeModal();
             finish(null);
           };
@@ -1303,7 +1400,7 @@ export async function runAdsgramBlock(
 
         observer = new MutationObserver(() => {
           if (!document.body.contains(el)) {
-            cancelSession();
+            cancelSession('cancel', 'Модальное окно Task закрыто');
             finish(null);
           }
         });
@@ -1313,7 +1410,7 @@ export async function runAdsgramBlock(
   }
 
   if (!sdkReady || typeof window.Adsgram?.init !== 'function') {
-    cancelSession();
+    cancelSession('sdk_error', 'window.Adsgram.init недоступен (блокировщик или сеть)');
     toast('Рекламный SDK Adsgram не загружен. Отключите блокировщик рекламы или откройте игру в Telegram Mini App.', true);
     return null;
   }
@@ -1322,8 +1419,9 @@ export async function runAdsgramBlock(
   try {
     controller = window.Adsgram.init({ blockId });
   } catch (err: any) {
-    cancelSession();
-    toast(formatAdsgramErrMsg(err?.description || err?.message, 'Не удалось инициализировать блок Adsgram'), true);
+    const initErr = String(err?.description || err?.message || 'Ошибка Adsgram.init');
+    cancelSession('sdk_error', initErr);
+    toast(formatAdsgramErrMsg(initErr, 'Не удалось инициализировать блок Adsgram'), true);
     return null;
   }
 
@@ -1395,7 +1493,9 @@ export async function runAdsgramBlock(
       (isInterstitialBlock ? (completeEventFired || res?.done === true || res === undefined) : !skipped)
     );
     if (!isDone) {
-      cancelSession();
+      const reason = bannerNotFound ? 'no_ad' : skipped ? 'skip' : 'error';
+      const rawDetail = eventError || res?.description || (skipped ? 'Реклама пропущена пользователем' : 'Показ не завершён');
+      cancelSession(reason, String(rawDetail));
       toast(
         formatAdsgramErrMsg(
           eventError || res?.description,
@@ -1421,8 +1521,9 @@ export async function runAdsgramBlock(
     });
     return { adProof: completed.adProof, blockKey, clicked: !!completed.clicked };
   } catch (err: any) {
-    cancelSession();
-    const rawMsg = err?.description || err?.message || eventError || '';
+    const rawMsg = String(err?.description || err?.message || eventError || '').trim();
+    const reason = bannerNotFound || /no ads/i.test(rawMsg) ? 'no_ad' : skipped ? 'skip' : 'error';
+    cancelSession(reason, rawMsg || 'Promise show() отклонился');
     toast(
       formatAdsgramErrMsg(rawMsg, 'Просмотр рекламы Adsgram не выполнен или отменён.'),
       true
@@ -3014,6 +3115,691 @@ export function collectAdminAdsRequireS2S(): boolean {
   return !!inp?.checked;
 }
 
+// ─── Admin Tab: Personal Ads Cabinet ("Реклама") ──────────────────────────────
+let ADM_ADS_SUBTAB: 'overview' | 'clubs' | 'wallets' | 'logs' | 'settings' = 'overview';
+let ADM_ADS_CLUB_Q = '';
+let ADM_ADS_CLUB_COMP = 'all';
+let ADM_ADS_WALLET_Q = '';
+let ADM_ADS_LOG_TYPE = 'all';
+let ADM_ADS_LOG_Q = '';
+let LAST_TEST_RESULT: { blockKey: string; ok: boolean; msg: string; ts: number } | null = null;
+
+function fmtRelTime(ts: number): string {
+  if (!ts) return '—';
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 60) return `${diffSec}с назад`;
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}м назад`;
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}ч назад`;
+  return new Date(ts).toLocaleDateString('ru-RU');
+}
+
+function formatBadgeHtml(sdkType: string): string {
+  if (sdkType === 'interstitial') return '<span class="adcab-badge info">Interstitial (int-)</span>';
+  if (sdkType === 'task') return '<span class="adcab-badge warn">Task (task-)</span>';
+  return '<span class="adcab-badge ok">Rewarded</span>';
+}
+
+function catLabelRu(cat: string): string {
+  switch (cat) {
+    case 'sponsors': return 'Спонсоры / РФС';
+    case 'friendly': return 'Товарищеские';
+    case 'predictions': return 'Лига прогнозов';
+    case 'national': return 'Сборная России';
+    case 'interview': return 'Интервью';
+    default: return cat;
+  }
+}
+
+export async function renderAdminAdsTab(ab: HTMLElement, ov: any, _reloadAdmin: () => void) {
+  ensureExtStyles();
+  const { api, act, e, toast } = B();
+
+  ab.innerHTML = '<div class="panel">Загрузка личного кабинета рекламы Adsgram…</div>';
+
+  let dash: any;
+  try {
+    dash = await api('/admin/ads/dashboard');
+  } catch (err: any) {
+    ab.innerHTML = `<div class="panel warn">Не удалось загрузить статистику рекламы: ${e(err?.message || 'Ошибка сервера')}</div>`;
+    return;
+  }
+
+  const paint = () => {
+    const k = dash.kpis || {};
+    const cfg = dash.config || {};
+    const fmt = dash.formatStats || {};
+    const uniqueTaskIds: string[] = Array.isArray(cfg.uniqueTaskIds) ? cfg.uniqueTaskIds : [];
+    const taskRuleOk = uniqueTaskIds.length <= 1;
+
+    const approvalRateTotal = (k.totalSponsorApprovals + k.totalSponsorDeclines) > 0
+      ? Math.round((k.totalSponsorApprovals / (k.totalSponsorApprovals + k.totalSponsorDeclines)) * 100)
+      : 95;
+
+    const heroHtml = `
+      <div class="adcab-hero">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">
+            <h2>Личный кабинет рекламы</h2>
+            <span class="adcab-badge ${cfg.requireAdsgramS2S ? 'ok' : 'muted'}">S2S: ${cfg.requireAdsgramS2S ? 'Строгий режим ВКЛ' : 'Клиентский режим'}</span>
+            <span class="adcab-badge ${taskRuleOk ? 'ok' : 'err'}">Task-блоков: ${uniqueTaskIds.length}/1</span>
+          </div>
+          <div class="adcab-hero-sub">
+            Полная аналитика по всем 14 рекламным блокам Adsgram, выплатам клубам в евро, начислению монет болельщикам, активным сессиям, S2S-подтверждениям и логам ошибок SDK.
+          </div>
+        </div>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button type="button" class="btn sm" id="adcab_refresh" style="background:#f0c419;color:#0d2f21;font-weight:700">🔄 Обновить</button>
+          <button type="button" class="btn sm alt" id="adcab_clear_logs">🧹 Очистить журнал</button>
+        </div>
+      </div>
+
+      ${!taskRuleOk ? `
+        <div class="warn" style="margin-bottom:14px">
+          <b>⚠️ Внимание по правилам Adsgram:</b> сейчас указано <b>${uniqueTaskIds.length}</b> разных ID формата <code>task-*</code> (${uniqueTaskIds.map((x) => `<code>${e(x)}</code>`).join(', ')}).
+          Adsgram разрешает только <b>1 блок типа Task на одно Mini App</b>. Укажите один и тот же <code>task-...</code> во всех Task-полях во вкладке «Настройки блоков», иначе лишние блоки не будут отдавать рекламу!
+        </div>
+      ` : ''}
+
+      <div class="adcab-kpis">
+        <div class="adcab-kpi">
+          <span class="adcab-kpi-lbl">Просмотров завершено</span>
+          <span class="adcab-kpi-val">${Number(k.totalCompleted || 0).toLocaleString('ru-RU')}</span>
+          <span class="adcab-kpi-sub">За сессию: ${k.totalCompletedSession || 0} / ${k.totalStartedSession || 0} запусков</span>
+        </div>
+        <div class="adcab-kpi">
+          <span class="adcab-kpi-lbl">Выплачено клубам</span>
+          <span class="adcab-kpi-val" style="color:#15803d">${fmtEuro(k.totalEurAllTime || 0)}</span>
+          <span class="adcab-kpi-sub">За 24ч: ${fmtEuro(k.totalEurCycle || 0)} · Одобрено ${approvalRateTotal}%</span>
+        </div>
+        <div class="adcab-kpi">
+          <span class="adcab-kpi-lbl">Монет с рекламы</span>
+          <span class="adcab-kpi-val" style="color:#b45309">${Number(k.totalCoinsIssuedByAds || 0).toLocaleString('ru-RU')}</span>
+          <span class="adcab-kpi-sub">На руках: ${fmtCoins(k.totalCoinsInCirculation || 0)} мон. (${k.totalWallets || 0} чел.)</span>
+        </div>
+        <div class="adcab-kpi">
+          <span class="adcab-kpi-lbl">Конверсия показа</span>
+          <span class="adcab-kpi-val">${k.completionRatePct !== null && k.completionRatePct !== undefined ? k.completionRatePct + '%' : '—'}</span>
+          <span class="adcab-kpi-sub">Ошибок: ${k.totalErrorsSession || 0} · Пропусков: ${k.totalCancelsSession || 0}</span>
+        </div>
+        <div class="adcab-kpi">
+          <span class="adcab-kpi-lbl">S2S Callbacks</span>
+          <span class="adcab-kpi-val">${k.s2sReceivedSession || 0}</span>
+          <span class="adcab-kpi-sub">Совпало с сессиями: ${k.s2sMatchedSession || 0}</span>
+        </div>
+        <div class="adcab-kpi">
+          <span class="adcab-kpi-lbl">Активность сейчас</span>
+          <span class="adcab-kpi-val">${k.activeSessionsCount || 0}</span>
+          <span class="adcab-kpi-sub">Клубов в 24ч цикле: ${k.activeClubsInCycleCount || 0}</span>
+        </div>
+      </div>
+
+      <div class="adcab-subtabs">
+        <button type="button" data-adcab-tab="overview" class="${ADM_ADS_SUBTAB === 'overview' ? 'on' : ''}">📊 Обзор и блоки (14)</button>
+        <button type="button" data-adcab-tab="clubs" class="${ADM_ADS_SUBTAB === 'clubs' ? 'on' : ''}">🏢 Клубы и спонсоры (${(dash.clubsTable || []).length})</button>
+        <button type="button" data-adcab-tab="wallets" class="${ADM_ADS_SUBTAB === 'wallets' ? 'on' : ''}">🪙 Игроки и монеты (${(dash.walletsTable || []).length})</button>
+        <button type="button" data-adcab-tab="logs" class="${ADM_ADS_SUBTAB === 'logs' ? 'on' : ''}">📜 Журнал и S2S (${(dash.recentEvents || []).length})</button>
+        <button type="button" data-adcab-tab="settings" class="${ADM_ADS_SUBTAB === 'settings' ? 'on' : ''}">⚙️ Настройки блоков</button>
+      </div>
+    `;
+
+    let bodyHtml = '';
+
+    if (ADM_ADS_SUBTAB === 'overview') {
+      const renderFmtCard = (title: string, subtitle: string, fObj: any, badgeCls: string) => {
+        const conv = fObj?.startedSession > 0 ? Math.round((fObj.completedSession / fObj.startedSession) * 100) + '%' : '—';
+        return `
+          <div class="panel" style="margin-bottom:0">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px">
+              <b style="font-size:14.5px">${e(title)}</b>
+              <span class="adcab-badge ${badgeCls}">${fObj?.configured || 0}/${fObj?.blocks || 0} ID</span>
+            </div>
+            <div class="small muted" style="margin-bottom:10px">${e(subtitle)}</div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;text-align:center;background:var(--soft);padding:8px;border-radius:8px;font-variant-numeric:tabular-nums">
+              <div><div class="small muted">Всего</div><b>${fObj?.completed || 0}</b></div>
+              <div><div class="small muted">Запуски/Ок</div><b>${fObj?.startedSession || 0}/${fObj?.completedSession || 0}</b></div>
+              <div><div class="small muted">Ошибки / %</div><b>${fObj?.errorsSession || 0} · ${conv}</b></div>
+            </div>
+          </div>`;
+      };
+
+      const topErrors: any[] = dash.topErrorReasons || [];
+      const sponsorsBr: any[] = dash.sponsorsBreakdown || [];
+      const blocksTable: any[] = dash.blocksTable || [];
+
+      bodyHtml = `
+        <div class="adcab-fmt-grid">
+          ${renderFmtCard('Rewarded (Видео)', 'Числовой Block ID · 15–30с видео с обязательным досмотром', fmt.reward, 'ok')}
+          ${renderFmtCard('Interstitial (int-)', 'Префикс int- · Короткие полноэкранные блоки 5–10с', fmt.interstitial, 'info')}
+          ${renderFmtCard('Task (task-)', 'Префикс task- · Карточка задания с переходом (макс. 1 на App)', fmt.task, 'warn')}
+        </div>
+
+        ${LAST_TEST_RESULT ? `
+          <div class="panel" style="border-left:4px solid ${LAST_TEST_RESULT.ok ? '#16a34a' : '#dc2626'};background:${LAST_TEST_RESULT.ok ? '#f0fdf4' : '#fef2f2'};margin-bottom:14px">
+            <div class="row sp" style="gap:8px;align-items:center">
+              <div>
+                <b>Тест блока <code>${e(LAST_TEST_RESULT.blockKey)}</code> (${new Date(LAST_TEST_RESULT.ts).toLocaleTimeString('ru-RU')}):</b>
+                <span>${e(LAST_TEST_RESULT.msg)}</span>
+              </div>
+              <button type="button" class="btn sm alt" id="adcab_close_test">Скрыть</button>
+            </div>
+          </div>
+        ` : ''}
+
+        <div class="panel">
+          <h3 style="margin:0 0 10px">Выручка клубов по источникам (за всё время)</h3>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+            ${sponsorsBr.map((sp) => `
+              <div style="border:1px solid var(--line);border-top:3px solid ${e(sp.accentColor)};border-radius:10px;padding:11px 13px;background:#fff;font-variant-numeric:tabular-nums">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:4px">
+                  <b style="font-size:14px">${e(sp.name)}</b>
+                  <code class="small">${e(sp.blockId)}</code>
+                </div>
+                <div style="font:700 18px Unbounded,sans-serif;color:#15803d;margin:4px 0">${fmtEuro(sp.eur)}</div>
+                <div class="small muted">Одобрено: <b>${sp.approved}</b>${sp.declined ? ` · Отказ (5%): <b>${sp.declined}</b>` : ''}</div>
+                <div class="small muted">Посл.: ${fmtRelTime(sp.lastAt)}</div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+
+        ${topErrors.length ? `
+          <div class="panel" style="border-left:4px solid #f59e0b;background:#fffbeb">
+            <h3 style="margin:0 0 8px;color:#92400e">Частые причины отказов и ошибок SDK (текущая сессия сервера)</h3>
+            <div style="display:flex;flex-wrap:wrap;gap:8px">
+              ${topErrors.map((er) => `
+                <span class="adcab-badge warn" style="white-space:normal;padding:5px 10px">
+                  <b>${er.count}×</b> ${e(er.reason)}
+                </span>
+              `).join('')}
+            </div>
+          </div>
+        ` : ''}
+
+        <div class="panel">
+          <div class="row sp" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
+            <div>
+              <h3 style="margin:0 0 2px">Все рекламные блоки приложения (14)</h3>
+              <div class="small muted">Нажмите «▶ Тест» внутри Telegram Mini App для проверки выдачи рекламы конкретного блока без начисления баланса.</div>
+            </div>
+          </div>
+          <div class="wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="l">Блок и категория</th>
+                  <th class="l">Block ID</th>
+                  <th>Формат</th>
+                  <th class="l">Награда / Лимит</th>
+                  <th>Заверш. всего</th>
+                  <th>Запуски / Ош.</th>
+                  <th>Выдано</th>
+                  <th>Посл.</th>
+                  <th>Проверка</th>
+                </tr>
+              </thead>
+              <tbody style="font-variant-numeric:tabular-nums">
+                ${blocksTable.map((b) => {
+                  const issued = b.eur > 0 ? fmtEuro(b.eur) : b.coins > 0 ? `${b.coins} мон.` : '—';
+                  return `
+                    <tr>
+                      <td class="l" style="min-width:210px">
+                        <div style="font-weight:700">${e(b.label)}</div>
+                        <div class="small muted">${e(catLabelRu(b.category))} · key: <code>${e(b.key)}</code></div>
+                      </td>
+                      <td class="l">
+                        <code style="font-weight:700">${e(b.blockId)}</code>
+                        <div class="small">${b.configured ? '<span style="color:#15803d">✓ Активен</span>' : '<span style="color:#b91c1c">✕ Заглушка</span>'}</div>
+                      </td>
+                      <td>${formatBadgeHtml(b.sdkType)}</td>
+                      <td class="l small">${e(b.rewardLabel)}<div class="muted">лимит: ${b.maxPerCycle}/цикл</div></td>
+                      <td><b>${b.completed}</b>${b.declinedCount ? `<div class="small muted">отказ: ${b.declinedCount}</div>` : ''}</td>
+                      <td>
+                        <div>${b.sessionStarted} / ${b.sessionCompleted}</div>
+                        <div class="small ${(b.sessionErrors + b.sessionCancels) > 0 ? 'warn' : 'muted'}" style="padding:0;background:none;border:0">ош:${b.sessionErrors} · отм:${b.sessionCancels}</div>
+                      </td>
+                      <td><b>${issued}</b></td>
+                      <td class="small muted">${fmtRelTime(b.lastAt)}</td>
+                      <td>
+                        <button type="button" class="btn alt sm" data-adcab-test="${e(b.key)}" data-adcab-lbl="${e(b.label)}">▶ Тест</button>
+                      </td>
+                    </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    } else if (ADM_ADS_SUBTAB === 'clubs') {
+      const q = ADM_ADS_CLUB_Q.trim().toLowerCase();
+      const clubs: any[] = (dash.clubsTable || []).filter((c: any) => {
+        if (ADM_ADS_CLUB_COMP !== 'all' && c.comp !== ADM_ADS_CLUB_COMP) return false;
+        if (q && !String(c.name || '').toLowerCase().includes(q)) return false;
+        return true;
+      });
+      bodyHtml = `
+        <div class="panel">
+          <div class="row sp" style="gap:10px;flex-wrap:wrap;margin-bottom:12px">
+            <div class="row" style="gap:6px;flex-wrap:wrap">
+              ${[['all', 'Все лиги'], ['rpl', 'РПЛ'], ['fnl', 'Первая лига'], ['fnl2', '2-я лига']].map(([cid, cname]) => `
+                <button type="button" class="btn sm ${ADM_ADS_CLUB_COMP === cid ? '' : 'alt'}" data-adcab-ccomp="${cid}">${cname}</button>
+              `).join('')}
+            </div>
+            <input id="adcab_club_q" value="${e(ADM_ADS_CLUB_Q)}" placeholder="Поиск клуба…" style="max-width:240px">
+          </div>
+          <div class="wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="l">Клуб</th>
+                  <th>Газпром (€750)</th>
+                  <th>Т-Банк (€500)</th>
+                  <th>Аэрофлот (€250)</th>
+                  <th>РФС (€1000)</th>
+                  <th>Товар.</th>
+                  <th>За 24ч</th>
+                  <th>Всего с рекл.</th>
+                  <th class="l">Статус / Сброс</th>
+                </tr>
+              </thead>
+              <tbody style="font-variant-numeric:tabular-nums">
+                ${clubs.map((c) => {
+                  const cdTxt = c.activeCooldownMs > 0 ? `КД ${fmtShortCooldown(c.activeCooldownMs)}` : '';
+                  const resetTxt = c.cycleActive && c.remainingMs > 0 ? `Сброс ${fmtCountdown(c.remainingMs)}` : 'Цикл свободен';
+                  return `
+                    <tr>
+                      <td class="l">
+                        <div class="t-cell">
+                          ${c.logo ? `<img class="t-logo" src="${e(c.logo)}" alt="">` : ''}
+                          <div>
+                            <b>${e(c.name)}</b>
+                            <div class="small muted">${e(c.compName)} · Бюджет: ${fmtEuro(c.budget)}</div>
+                          </div>
+                        </div>
+                      </td>
+                      <td><b>${c.gazpromViews}/10</b>${c.gazpromDeclined ? `<div class="small muted">отк:${c.gazpromDeclined}</div>` : ''}</td>
+                      <td><b>${c.tbankViews}/10</b>${c.tbankDeclined ? `<div class="small muted">отк:${c.tbankDeclined}</div>` : ''}</td>
+                      <td><b>${c.aeroflotViews}/10</b>${c.aeroflotDeclined ? `<div class="small muted">отк:${c.aeroflotDeclined}</div>` : ''}</td>
+                      <td>
+                        <div><b>${c.totalViewsCycle}/30</b></div>
+                        <div class="small">${c.rfsClaimed ? `<span style="color:#15803d;font-weight:700">Бонус (${c.rfsExtraViews}/30)</span>` : c.rfsUnlocked ? '<span style="color:#0284c7">Открыт</span>' : '<span class="muted">закрыт</span>'}</div>
+                      </td>
+                      <td><b>${c.friendlyAdsTotal}</b></td>
+                      <td><b>${fmtEuro(c.earnedEurCycle + c.rfsEarnedEurCycle)}</b></td>
+                      <td><b style="color:#15803d">${fmtEuro(c.allTimeAdEur)}</b><div class="small muted">${c.allTimeAdTxCount} выпл.</div></td>
+                      <td class="l small">
+                        <div>${resetTxt}</div>
+                        ${cdTxt ? `<div style="color:#b45309;font-weight:600">${cdTxt}</div>` : `<div class="muted">Посл.: ${fmtRelTime(c.lastAdAt)}</div>`}
+                      </td>
+                    </tr>`;
+                }).join('') || '<tr><td colspan="9" class="empty">Клубы не найдены</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    } else if (ADM_ADS_SUBTAB === 'wallets') {
+      const q = ADM_ADS_WALLET_Q.trim().toLowerCase();
+      const wallets: any[] = (dash.walletsTable || []).filter((w: any) => {
+        if (!q) return true;
+        return `${w.displayName} ${w.tgId} ${w.telegramUsername} ${w.teamName}`.toLowerCase().includes(q);
+      });
+      bodyHtml = `
+        <div class="panel">
+          <div class="row sp" style="gap:10px;flex-wrap:wrap;margin-bottom:12px">
+            <div>
+              <h3 style="margin:0 0 2px">Кошельки болельщиков и владельцев (Лига прогнозов)</h3>
+              <div class="small muted">Показывается баланс монет, сколько получено всего и активность по рекламным блокам монет за текущие 24 часа.</div>
+            </div>
+            <input id="adcab_wallet_q" value="${e(ADM_ADS_WALLET_Q)}" placeholder="Поиск по имени, @username, TG ID…" style="max-width:260px">
+          </div>
+          <div class="wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="l">Пользователь</th>
+                  <th class="l">Telegram</th>
+                  <th>Баланс</th>
+                  <th>Всего заработано</th>
+                  <th>За 24ч (+1 / +2 / +3)</th>
+                  <th class="l">Последний просмотр</th>
+                </tr>
+              </thead>
+              <tbody style="font-variant-numeric:tabular-nums">
+                ${wallets.map((w) => `
+                  <tr>
+                    <td class="l">
+                      <div class="t-cell">
+                        ${w.photoUrl ? `<img src="${e(w.photoUrl)}" alt="" style="width:26px;height:26px;border-radius:50%;object-fit:cover">` : ''}
+                        <div>
+                          <b>${e(w.displayName)}</b>
+                          <div class="small muted">${w.teamName ? `Клуб: ${e(w.teamName)}` : (w.profileKind === 'admin' ? 'Администратор' : 'Болельщик')}</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td class="l small">
+                      ${w.tgId ? `<code>${e(w.tgId)}</code>` : '<span class="muted">Браузер</span>'}
+                      ${w.telegramUsername ? `<div>@${e(w.telegramUsername)}</div>` : ''}
+                    </td>
+                    <td><b style="color:#b45309">${fmtCoins(w.coins)} мон.</b></td>
+                    <td><b>${fmtCoins(w.totalEarnedCoins)}</b> <span class="small muted">(~${fmtCoins(w.earnedAdEst)} с рекл.)</span></td>
+                    <td><b>${w.cycleTotal}</b> <span class="small muted">(${w.cycleShort} / ${w.cycleBanner} / ${w.cycleLong})</span></td>
+                    <td class="l small muted">${fmtRelTime(w.lastAdAt)}</td>
+                  </tr>`).join('') || '<tr><td colspan="6" class="empty">Кошельки не найдены</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    } else if (ADM_ADS_SUBTAB === 'logs') {
+      const q = ADM_ADS_LOG_Q.trim().toLowerCase();
+      const events: any[] = (dash.recentEvents || []).filter((ev: any) => {
+        if (ADM_ADS_LOG_TYPE !== 'all' && ev.type !== ADM_ADS_LOG_TYPE) return false;
+        if (q) {
+          const hay = `${ev.actorLabel} ${ev.blockKey} ${ev.blockId} ${ev.tgId} ${ev.detail}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+      const activeSess: any[] = dash.activeSessions || [];
+      const s2sList: any[] = dash.recentS2S || [];
+
+      const evBadge = (tp: string) => {
+        if (tp === 'credit') return '<span class="adcab-badge ok">💰 Начислено</span>';
+        if (tp === 'complete') return '<span class="adcab-badge ok">✅ Досмотрено</span>';
+        if (tp === 'start') return '<span class="adcab-badge info">▶ Запуск</span>';
+        if (tp === 's2s') return '<span class="adcab-badge info">🔗 S2S Webhook</span>';
+        if (tp === 'cancel') return '<span class="adcab-badge warn">⏭ Отмена/Пропуск</span>';
+        return '<span class="adcab-badge err">❌ Ошибка</span>';
+      };
+
+      bodyHtml = `
+        <div class="grid g2">
+          <div class="panel" style="margin-bottom:0">
+            <h3 style="margin:0 0 6px">Активные просмотры прямо сейчас (${activeSess.length})</h3>
+            <div class="small muted" style="margin-bottom:10px">Сессии в окне последних 15 минут, ещё не использованные для действия.</div>
+            ${activeSess.length ? `
+              <div class="wrap">
+                <table>
+                  <thead><tr><th class="l">Кто</th><th class="l">Блок</th><th>Прошло</th><th>Статус</th></tr></thead>
+                  <tbody style="font-variant-numeric:tabular-nums">
+                    ${activeSess.map((s) => `
+                      <tr>
+                        <td class="l small"><b>${e(s.actorLabel)}</b>${s.tgId ? ` <span class="muted">#${e(s.tgId)}</span>` : ''}</td>
+                        <td class="l small"><code>${e(s.blockId)}</code> <span class="muted">(${e(s.blockKey)})</span></td>
+                        <td>${s.elapsedSec}с</td>
+                        <td>${s.verified ? '<span class="adcab-badge ok">Подтверждена</span>' : s.s2sConfirmed ? '<span class="adcab-badge info">S2S есть</span>' : '<span class="adcab-badge muted">Смотрит</span>'}</td>
+                      </tr>`).join('')}
+                  </tbody>
+                </table>
+              </div>
+            ` : '<div class="small muted">Сейчас нет активных рекламных сессий.</div>'}
+          </div>
+
+          <div class="panel" style="margin-bottom:0">
+            <h3 style="margin:0 0 6px">S2S Reward URL и входящие отклики (${s2sList.length})</h3>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;background:var(--soft);padding:8px 10px;border-radius:8px;border:1px solid var(--line);margin-bottom:10px">
+              <code id="adcab_s2s_url" style="font-size:12px;word-break:break-all;flex:1">${e(cfg.sdkRewardUrl)}</code>
+              <button type="button" class="btn sm alt" id="adcab_copy_s2s">📋 Копировать</button>
+            </div>
+            ${s2sList.length ? `
+              <div class="wrap" style="max-height:220px;overflow-y:auto">
+                <table>
+                  <thead><tr><th class="l">Время</th><th class="l">TG ID</th><th class="l">Block ID</th><th>Статус</th></tr></thead>
+                  <tbody style="font-variant-numeric:tabular-nums">
+                    ${s2sList.slice(0, 25).map((r) => `
+                      <tr>
+                        <td class="l small">${new Date(r.receivedAt).toLocaleTimeString('ru-RU')}</td>
+                        <td class="l"><code>${e(r.tgId)}</code></td>
+                        <td class="l"><code>${e(r.blockId || '—')}</code></td>
+                        <td>${r.used ? '<span class="adcab-badge ok">Засчитан</span>' : '<span class="adcab-badge info">В ожидании</span>'}</td>
+                      </tr>`).join('')}
+                  </tbody>
+                </table>
+              </div>
+            ` : '<div class="small muted">S2S callback-запросы от Adsgram ещё не поступали в этой сессии сервера.</div>'}
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:14px">
+          <div class="row sp" style="gap:10px;flex-wrap:wrap;margin-bottom:12px">
+            <div class="row" style="gap:6px;flex-wrap:wrap">
+              ${[
+                ['all', 'Все'],
+                ['credit', 'Начисления'],
+                ['complete', 'Досмотрено'],
+                ['error', 'Ошибки / Нет рекламы'],
+                ['cancel', 'Отмены / Пропуски'],
+                ['s2s', 'S2S'],
+                ['start', 'Запуски'],
+              ].map(([tp, tl]) => `
+                <button type="button" class="btn sm ${ADM_ADS_LOG_TYPE === tp ? '' : 'alt'}" data-adcab-logt="${tp}">${tl}</button>
+              `).join('')}
+            </div>
+            <input id="adcab_log_q" value="${e(ADM_ADS_LOG_Q)}" placeholder="Фильтр: клуб, блок, ошибка, TG ID…" style="max-width:260px">
+          </div>
+
+          <div class="wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="l">Время</th>
+                  <th>Событие</th>
+                  <th class="l">Кто / TG ID</th>
+                  <th class="l">Блок (ID)</th>
+                  <th class="l">Подробности и причина</th>
+                </tr>
+              </thead>
+              <tbody style="font-variant-numeric:tabular-nums">
+                ${events.map((ev) => `
+                  <tr>
+                    <td class="l small muted" style="white-space:nowrap">${new Date(ev.ts).toLocaleTimeString('ru-RU')}</td>
+                    <td>${evBadge(ev.type)}</td>
+                    <td class="l small"><b>${e(ev.actorLabel)}</b>${ev.tgId ? `<div class="muted">TG: ${e(ev.tgId)}</div>` : ''}</td>
+                    <td class="l small"><code>${e(ev.blockId || '—')}</code><div class="muted">${e(ev.blockKey || '')}</div></td>
+                    <td class="l small" style="white-space:normal;min-width:240px">
+                      ${e(ev.detail)}
+                      ${ev.durationMs ? ` <span class="muted">(${(ev.durationMs / 1000).toFixed(1)}с)</span>` : ''}
+                    </td>
+                  </tr>`).join('') || '<tr><td colspan="5" class="empty">Событий по выбранному фильтру пока нет.</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    } else if (ADM_ADS_SUBTAB === 'settings') {
+      const defs: any[] = cfg.defs || [];
+      const blocksMap = cfg.blocks || {};
+      const categories = ['sponsors', 'predictions', 'friendly', 'national', 'interview'];
+
+      bodyHtml = `
+        <div class="panel">
+          <h3 style="margin:0 0 6px">Управление Block ID и проверкой Adsgram</h3>
+          <p class="small muted" style="margin:0 0 14px">
+            Формат ID в Adsgram: число (<code>60557</code>) — длинная Reward-реклама; <code>int-...</code> — короткий Interstitial; <code>task-...</code> — карточка Task (не более 1 уникального Task-блока на приложение!).
+          </p>
+
+          ${categories.map((cat) => {
+            const items = defs.filter((d) => d.category === cat);
+            if (!items.length) return '';
+            return `
+              <div style="margin-bottom:16px">
+                <div style="font-weight:700;font-size:13.5px;color:#0d2f21;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--line)">${e(catLabelRu(cat))}</div>
+                <div class="grid g2">
+                  ${items.map((d) => {
+                    const val = String(blocksMap[d.key] || d.defaultBlockId);
+                    const ok = isRealConfiguredSdkBlockId(val);
+                    return `
+                      <label class="small" style="display:block">
+                        <span style="display:flex;justify-content:space-between;gap:6px;align-items:center">
+                          <span>${e(d.label)}</span>
+                          <span style="font-weight:700;color:${ok ? '#15803d' : '#b91c1c'}">${ok ? '✓ Валидный ID' : '✕ Неверный формат'}</span>
+                        </span>
+                        <input id="adcab_blk_${e(d.key)}" value="${e(val)}" style="width:100%;margin-top:4px;font-family:monospace">
+                      </label>`;
+                  }).join('')}
+                </div>
+              </div>`;
+          }).join('')}
+
+          <div style="margin-top:12px;padding:12px 14px;background:var(--soft);border:1px solid var(--line);border-radius:10px">
+            <div style="font-weight:700;font-size:13.5px;margin-bottom:6px">Серверная проверка Mini App SDK (S2S Reward URL)</div>
+            <div class="small muted" style="line-height:1.5;margin-bottom:8px">
+              Если включаете строгую проверку — обязательно пропишите этот Reward URL во всех Reward-блоках в кабинете Adsgram:<br>
+              <code style="user-select:all;word-break:break-all">${e(cfg.sdkRewardUrl)}</code>
+            </div>
+            <label class="small" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" id="adcab_require_s2s" ${cfg.requireAdsgramS2S ? 'checked' : ''} style="width:auto">
+              <span>Требовать строгое S2S-подтверждение от сервера Adsgram (Reward URL) для Reward/Task блоков</span>
+            </label>
+          </div>
+
+          <div class="row sp" style="margin-top:14px;flex-wrap:wrap;gap:10px">
+            <button type="button" class="btn" id="adcab_save_cfg">💾 Сохранить настройки рекламы</button>
+            <button type="button" class="btn alt sm" id="adcab_award_pred">🏆 Выдать призы Топ-3 Лиги прогнозов за сезон</button>
+          </div>
+        </div>
+      `;
+    }
+
+    ab.innerHTML = heroHtml + bodyHtml;
+
+    // Wire actions
+    const refreshBtn = document.getElementById('adcab_refresh');
+    if (refreshBtn) refreshBtn.onclick = () => renderAdminAdsTab(ab, ov, _reloadAdmin);
+
+    const clearBtn = document.getElementById('adcab_clear_logs');
+    if (clearBtn) {
+      clearBtn.onclick = async () => {
+        if (!confirm('Очистить журнал рекламных событий и счётчики текущей сессии сервера? (Выплаты в базе не затронутся)')) return;
+        await act(() => api('/admin/ads/clear-logs', {}), 'Журнал рекламы очищен');
+        renderAdminAdsTab(ab, ov, _reloadAdmin);
+      };
+    }
+
+    const closeTestBtn = document.getElementById('adcab_close_test');
+    if (closeTestBtn) {
+      closeTestBtn.onclick = () => {
+        LAST_TEST_RESULT = null;
+        paint();
+      };
+    }
+
+    ab.querySelectorAll('[data-adcab-tab]').forEach((b) => {
+      (b as HTMLButtonElement).onclick = () => {
+        ADM_ADS_SUBTAB = (b as HTMLElement).dataset.adcabTab as any;
+        paint();
+      };
+    });
+
+    ab.querySelectorAll('[data-adcab-test]').forEach((b) => {
+      (b as HTMLButtonElement).onclick = async () => {
+        const btn = b as HTMLButtonElement;
+        if (btn.disabled) return;
+        btn.disabled = true;
+        const bk = btn.dataset.adcabTest!;
+        const lbl = btn.dataset.adcabLbl || bk;
+        try {
+          const adRes = await runAdsgramBlock(bk, `Тест блока: ${lbl}`, 'Проверка выдачи Adsgram без начисления наград');
+          LAST_TEST_RESULT = adRes
+            ? { blockKey: bk, ok: true, msg: 'Блок отработал успешно, получено подтверждение от сервера!', ts: Date.now() }
+            : { blockKey: bk, ok: false, msg: 'Показ не завершён или реклама не выдана (см. детали в «Журнал и S2S»).', ts: Date.now() };
+          renderAdminAdsTab(ab, ov, _reloadAdmin);
+        } catch (err: any) {
+          LAST_TEST_RESULT = { blockKey: bk, ok: false, msg: err?.message || 'Ошибка теста', ts: Date.now() };
+          renderAdminAdsTab(ab, ov, _reloadAdmin);
+        }
+      };
+    });
+
+    ab.querySelectorAll('[data-adcab-ccomp]').forEach((b) => {
+      (b as HTMLButtonElement).onclick = () => {
+        ADM_ADS_CLUB_COMP = (b as HTMLElement).dataset.adcabCcomp || 'all';
+        paint();
+      };
+    });
+
+    const clubQ = document.getElementById('adcab_club_q') as HTMLInputElement | null;
+    if (clubQ) {
+      clubQ.oninput = () => {
+        ADM_ADS_CLUB_Q = clubQ.value;
+        const pos = clubQ.selectionStart ?? ADM_ADS_CLUB_Q.length;
+        paint();
+        const next = document.getElementById('adcab_club_q') as HTMLInputElement | null;
+        if (next) {
+          next.focus();
+          try { next.setSelectionRange(pos, pos); } catch {}
+        }
+      };
+    }
+
+    const walletQ = document.getElementById('adcab_wallet_q') as HTMLInputElement | null;
+    if (walletQ) {
+      walletQ.oninput = () => {
+        ADM_ADS_WALLET_Q = walletQ.value;
+        const pos = walletQ.selectionStart ?? ADM_ADS_WALLET_Q.length;
+        paint();
+        const next = document.getElementById('adcab_wallet_q') as HTMLInputElement | null;
+        if (next) {
+          next.focus();
+          try { next.setSelectionRange(pos, pos); } catch {}
+        }
+      };
+    }
+
+    ab.querySelectorAll('[data-adcab-logt]').forEach((b) => {
+      (b as HTMLButtonElement).onclick = () => {
+        ADM_ADS_LOG_TYPE = (b as HTMLElement).dataset.adcabLogt || 'all';
+        paint();
+      };
+    });
+
+    const logQ = document.getElementById('adcab_log_q') as HTMLInputElement | null;
+    if (logQ) {
+      logQ.oninput = () => {
+        ADM_ADS_LOG_Q = logQ.value;
+        const pos = logQ.selectionStart ?? ADM_ADS_LOG_Q.length;
+        paint();
+        const next = document.getElementById('adcab_log_q') as HTMLInputElement | null;
+        if (next) {
+          next.focus();
+          try { next.setSelectionRange(pos, pos); } catch {}
+        }
+      };
+    }
+
+    const copyS2sBtn = document.getElementById('adcab_copy_s2s');
+    if (copyS2sBtn) {
+      copyS2sBtn.onclick = () => {
+        const u = document.getElementById('adcab_s2s_url')?.textContent || cfg.sdkRewardUrl || '';
+        navigator.clipboard?.writeText(u).then(() => toast('Reward URL скопирован')).catch(() => toast('Не удалось скопировать', true));
+      };
+    }
+
+    const saveCfgBtn = document.getElementById('adcab_save_cfg');
+    if (saveCfgBtn) {
+      saveCfgBtn.onclick = async () => {
+        const adsgramBlocks: Record<string, string> = {};
+        for (const d of cfg.defs || []) {
+          const inp = document.getElementById('adcab_blk_' + d.key) as HTMLInputElement | null;
+          if (inp && inp.value.trim()) adsgramBlocks[d.key] = inp.value.trim();
+        }
+        const requireAdsgramS2S = !!(document.getElementById('adcab_require_s2s') as HTMLInputElement | null)?.checked;
+        await act(() => api('/admin/ads/settings', { adsgramBlocks, requireAdsgramS2S }), 'Настройки рекламы сохранены');
+        renderAdminAdsTab(ab, ov, _reloadAdmin);
+      };
+    }
+
+    const awardPredBtn = document.getElementById('adcab_award_pred');
+    if (awardPredBtn) {
+      awardPredBtn.onclick = async () => {
+        await act(() => api('/admin/predictions/award-season', {}), 'Призы Лиги прогнозов выданы Топ-3');
+      };
+    }
+  };
+
+  paint();
+}
+
 window.__RPL_EXT__ = {
   getClientHeaders,
   syncTelegramAuth,
@@ -3024,6 +3810,7 @@ window.__RPL_EXT__ = {
   renderAdminAdsSettingsHtml,
   collectAdminAdsBlocks,
   collectAdminAdsRequireS2S,
+  renderAdminAdsTab,
 };
 
 if (typeof window !== 'undefined' && (window.Telegram?.WebApp?.initData || window.Telegram?.WebApp?.initDataUnsafe?.user?.id)) {

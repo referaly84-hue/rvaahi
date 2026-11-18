@@ -8747,6 +8747,7 @@ async function pgAdmin(app) {
     ['friendly', `Товарищеские${ov.pendingFriendlyCount ? ' (' + ov.pendingFriendlyCount + ')' : ''}`],
     ['transfers', `Трансферы${ov.transfers.length ? ' (' + ov.transfers.length + ')' : ''}`],
     ['budget', 'Бюджет'],
+    ['ads', '📢 Реклама'],
     ['aiq', '🤖 Очередь ИИ'],
     ['aihistory', '📜 История ИИ'],
     ['settings', 'Настройки']
@@ -12660,6 +12661,10 @@ async function pgAdmin(app) {
     };
 
     loadHistory();
+  }
+  else if (AT === 'ads') {
+    const ext = await ensureExt();
+    await ext.renderAdminAdsTab(ab, ov, re);
   }
   else if (AT === 'settings') {
     const s = ov.settings, k = ov.keys, mo = ov.models || {};

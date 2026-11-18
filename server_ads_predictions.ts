@@ -1431,10 +1431,130 @@ const adSessions = new Map<string, PendingAdSession>();
 interface SdkS2SRewardEntry {
   tgId: string;
   blockId: string;
+  blockKey?: string;
   receivedAt: number;
   used: boolean;
 }
 const recentSdkS2SRewards: SdkS2SRewardEntry[] = [];
+
+export interface AdEventLogItem {
+  id: string;
+  ts: number;
+  iso: string;
+  type: 'start' | 'complete' | 'credit' | 'cancel' | 'error' | 's2s' | 's2s_fail';
+  blockKey: string;
+  blockId: string;
+  actorKey: string;
+  actorLabel: string;
+  tgId: string;
+  detail: string;
+  durationMs?: number;
+  eur?: number;
+  coins?: number;
+}
+
+const recentAdEvents: AdEventLogItem[] = [];
+const memAdCounters: Record<string, {
+  started: number;
+  completed: number;
+  errors: number;
+  cancels: number;
+  s2sReceived: number;
+  s2sMatched: number;
+}> = {};
+const errorReasonCounts: Record<string, number> = {};
+
+function getMemBlockCounter(blockKey: string) {
+  const k = blockKey || '__unknown__';
+  if (!memAdCounters[k]) {
+    memAdCounters[k] = { started: 0, completed: 0, errors: 0, cancels: 0, s2sReceived: 0, s2sMatched: 0 };
+  }
+  return memAdCounters[k];
+}
+
+function ensureDbAdStat(db: any, blockKey: string) {
+  db.adStats ||= {};
+  if (!db.adStats[blockKey] || typeof db.adStats[blockKey] !== 'object') {
+    db.adStats[blockKey] = { completed: 0, approved: 0, declined: 0, eur: 0, coins: 0, lastAt: 0 };
+  }
+  return db.adStats[blockKey];
+}
+
+function resolveActorLabelForLog(ctx: AdServerContext | null, actorKey: string, tgId?: string): string {
+  if (!ctx) return actorKey || (tgId ? `TG #${tgId}` : 'Гость');
+  try {
+    const db = ctx.getDb();
+    if (actorKey.startsWith('club:')) {
+      const tid = actorKey.slice(5);
+      const tName = ctx.tn(tid);
+      const prof = db.ownerProfiles?.[actorKey];
+      const extra = prof?.displayName ? ` (${prof.displayName})` : '';
+      return tName ? `${tName}${extra}` : actorKey;
+    }
+    if (actorKey.startsWith('admin:')) return 'Администратор';
+    const prof = db.ownerProfiles?.[actorKey];
+    if (prof?.displayName) return prof.displayName;
+    if (tgId && db.telegramUsers?.[`tg_${tgId}`]?.displayName) {
+      return db.telegramUsers[`tg_${tgId}`].displayName;
+    }
+  } catch {}
+  return tgId ? `TG #${tgId}` : (actorKey || 'Пользователь');
+}
+
+function pushAdEvent(
+  ctx: AdServerContext | null,
+  ev: {
+    type: AdEventLogItem['type'];
+    blockKey: string;
+    blockId: string;
+    actorKey: string;
+    tgId?: string;
+    detail: string;
+    durationMs?: number;
+    eur?: number;
+    coins?: number;
+  }
+) {
+  const now = Date.now();
+  const tgId = String(ev.tgId || '').replace(/[^0-9]/g, '').slice(0, 32);
+  recentAdEvents.unshift({
+    id: 'adev_' + now.toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+    ts: now,
+    iso: new Date(now).toISOString(),
+    type: ev.type,
+    blockKey: ev.blockKey || '',
+    blockId: ev.blockId || '',
+    actorKey: ev.actorKey || '',
+    actorLabel: resolveActorLabelForLog(ctx, ev.actorKey || '', tgId),
+    tgId,
+    detail: String(ev.detail || '').slice(0, 260),
+    durationMs: ev.durationMs,
+    eur: ev.eur,
+    coins: ev.coins,
+  });
+  if (recentAdEvents.length > 250) recentAdEvents.length = 250;
+}
+
+function bumpErrorReason(rawReason: string) {
+  const clean = String(rawReason || '').trim().slice(0, 120);
+  if (!clean) return;
+  errorReasonCounts[clean] = (errorReasonCounts[clean] || 0) + 1;
+}
+
+function resolveBlockKeyBySdkId(db: any, blockId: string): string {
+  const clean = String(blockId || '').trim();
+  if (!clean) return '';
+  const bare = clean.replace(/^(int-|task-)/i, '');
+  const blocks = getAdsgramBlocks(db);
+  for (const def of ADSGRAM_BLOCKS) {
+    const cfg = String(blocks[def.key] || '').trim();
+    if (!cfg) continue;
+    if (cfg === clean || (bare && cfg.replace(/^(int-|task-)/i, '') === bare)) {
+      return def.key;
+    }
+  }
+  return '';
+}
 
 function pruneAdSessions() {
   const now = Date.now();
@@ -1457,14 +1577,15 @@ export function isConfiguredAdsgramBlockId(def: AdsgramBlockDef | undefined, raw
   return /^\d+$/.test(v) || /^task-\d+$/i.test(v) || /^int-\d+$/i.test(v);
 }
 
-function recordSdkS2SReward(tgId: string, blockId: string) {
+function recordSdkS2SReward(tgId: string, blockId: string, ctx?: AdServerContext) {
   pruneAdSessions();
   const cleanTg = String(tgId || '').replace(/[^0-9]/g, '').slice(0, 32);
   if (!cleanTg) return false;
   const cleanBlk = String(blockId || '').trim().slice(0, 64);
   const cleanBlkBare = cleanBlk.replace(/^(int-|task-)/i, '');
   const now = Date.now();
-  recentSdkS2SRewards.push({ tgId: cleanTg, blockId: cleanBlk, receivedAt: now, used: false });
+  let matchedBlockKey = ctx ? resolveBlockKeyBySdkId(ctx.getDb(), cleanBlk) : '';
+  let matchedSession = false;
   // Mark any matching active session for this user as S2S confirmed
   for (const s of adSessions.values()) {
     const sBare = s.blockId.replace(/^(int-|task-)/i, '');
@@ -1475,8 +1596,30 @@ function recordSdkS2SReward(tgId: string, blockId: string) {
       (!cleanBlk || cleanBlk === s.blockId || (cleanBlkBare && cleanBlkBare === sBare))
     ) {
       s.s2sConfirmed = true;
+      matchedSession = true;
+      if (!matchedBlockKey) matchedBlockKey = s.blockKey;
     }
   }
+  recentSdkS2SRewards.push({
+    tgId: cleanTg,
+    blockId: cleanBlk,
+    blockKey: matchedBlockKey || undefined,
+    receivedAt: now,
+    used: false,
+  });
+  const cnt = getMemBlockCounter(matchedBlockKey || '__unknown__');
+  cnt.s2sReceived += 1;
+  if (matchedSession) cnt.s2sMatched += 1;
+  pushAdEvent(ctx || null, {
+    type: 's2s',
+    blockKey: matchedBlockKey,
+    blockId: cleanBlk || '—',
+    actorKey: `user:tg_${cleanTg}`,
+    tgId: cleanTg,
+    detail: matchedSession
+      ? `S2S callback от Adsgram подтвердил активную сессию (${cleanBlk || 'без blockId'})`
+      : `S2S callback получен (${cleanBlk || 'без blockId'})`,
+  });
   return true;
 }
 
@@ -2664,6 +2807,27 @@ function executeSponsorCredit(
   });
   st.history = st.history.slice(0, 30);
 
+  const dbStat = ensureDbAdStat(db, sp.blockKey);
+  if (approved) {
+    dbStat.approved = Number(dbStat.approved || 0) + 1;
+    dbStat.eur = Number(dbStat.eur || 0) + sp.rewardEur;
+  } else {
+    dbStat.declined = Number(dbStat.declined || 0) + 1;
+  }
+  dbStat.lastAt = now;
+
+  const blocks = getAdsgramBlocks(db);
+  pushAdEvent(ctx, {
+    type: 'credit',
+    blockKey: sp.blockKey,
+    blockId: blocks[sp.blockKey] || sp.blockKey,
+    actorKey: `club:${teamId}`,
+    detail: approved
+      ? `Спонсор «${sp.name}» одобрил выплату +€${sp.rewardEur.toLocaleString('ru-RU')}`
+      : `Спонсор «${sp.name}» отклонил выплату (шанс 5%), показ ${st.views[sp.id]}/${sp.maxViews} засчитан`,
+    eur: approved ? sp.rewardEur : 0,
+  });
+
   ctx.save();
   const summary = buildSponsorSummary(ctx, teamId);
   return {
@@ -2710,6 +2874,21 @@ function executeCoinsCredit(
   wallet.lastAdAt[blockKey] = now;
   wallet.coins = roundCoins(Number(wallet.coins || 0) + reward);
   wallet.totalEarnedCoins = roundCoins(Number(wallet.totalEarnedCoins || 0) + reward);
+
+  const dbStat = ensureDbAdStat(db, blockKey);
+  dbStat.coins = Number(dbStat.coins || 0) + reward;
+  dbStat.lastAt = now;
+
+  const blocks = getAdsgramBlocks(db);
+  pushAdEvent(ctx, {
+    type: 'credit',
+    blockKey,
+    blockId: blocks[blockKey] || blockKey,
+    actorKey,
+    detail: `Начислено +${reward} мон. за рекламу прогнозов (баланс: ${wallet.coins})`,
+    coins: reward,
+  });
+
   ctx.save();
 
   return {
@@ -2815,6 +2994,15 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       s2sConfirmed: false,
       consumed: false,
     });
+    getMemBlockCounter(blockKey).started += 1;
+    pushAdEvent(ctx, {
+      type: 'start',
+      blockKey,
+      blockId,
+      actorKey: actor.actorKey,
+      tgId,
+      detail: `Запуск блока (${def.format === 'short' && blockId.startsWith('int-') ? 'Interstitial' : blockId.startsWith('task-') ? 'Task' : 'Rewarded'})`,
+    });
     res.json({
       ok: 1,
       sessionToken: token,
@@ -2829,13 +3017,54 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
 
   app.post('/api/ads/cancel', (req: any, res) => {
     const token = String(req.body?.sessionToken || '').trim();
+    const reason = String(req.body?.reason || '').trim();
+    const detail = String(req.body?.detail || '').trim();
     if (!token) return res.json({ ok: 1 });
     const s = adSessions.get(token);
     if (s && !s.consumed) {
       const actor = resolveActor(req);
       if (s.actorKey === actor.actorKey || (req.me?.role === 'admin' && s.actorKey.startsWith('admin:'))) {
+        const isErr = reason === 'error' || reason === 'no_ad' || reason === 'sdk_error';
+        const cnt = getMemBlockCounter(s.blockKey);
+        if (isErr) cnt.errors += 1;
+        else cnt.cancels += 1;
+        if (detail) bumpErrorReason(detail);
+        pushAdEvent(ctx, {
+          type: isErr ? 'error' : 'cancel',
+          blockKey: s.blockKey,
+          blockId: s.blockId,
+          actorKey: s.actorKey,
+          tgId: s.tgId,
+          durationMs: Date.now() - s.startedAt,
+          detail: detail || (reason === 'skip' ? 'Пользователь пропустил / закрыл рекламу' : 'Показ отменён'),
+        });
         adSessions.delete(token);
       }
+    }
+    res.json({ ok: 1 });
+  });
+
+  app.post('/api/ads/client-event', (req: any, res) => {
+    const blockKey = String(req.body?.blockKey || '').trim().slice(0, 64);
+    const blockId = String(req.body?.blockId || '').trim().slice(0, 64);
+    const kind = String(req.body?.kind || 'error').trim();
+    const detail = String(req.body?.detail || '').trim().slice(0, 220);
+    const actor = resolveActor(req);
+    const hints = extractTgHintsFromReq(ctx, req);
+    const tgId = String(hints.tgId || '').replace(/[^0-9]/g, '');
+    if (detail) {
+      const cnt = getMemBlockCounter(blockKey || '__unknown__');
+      if (kind === 'cancel' || kind === 'skip') cnt.cancels += 1;
+      else cnt.errors += 1;
+      bumpErrorReason(detail);
+      pushAdEvent(ctx, {
+        type: kind === 'cancel' || kind === 'skip' ? 'cancel' : 'error',
+        blockKey,
+        blockId,
+        actorKey: actor.actorKey,
+        tgId,
+        detail,
+      });
     }
     res.json({ ok: 1 });
   });
@@ -2859,7 +3088,11 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     }
 
     const now = Date.now();
-    if (now - s.startedAt > 15 * 60 * 1000) {
+    const durationMs = now - s.startedAt;
+    if (durationMs > 15 * 60 * 1000) {
+      getMemBlockCounter(s.blockKey).errors += 1;
+      bumpErrorReason('Истекло время рекламной сессии (>15 мин)');
+      pushAdEvent(ctx, { type: 'error', blockKey: s.blockKey, blockId: s.blockId, actorKey: s.actorKey, tgId: s.tgId, durationMs, detail: 'Истекло время рекламной сессии (>15 мин)' });
       adSessions.delete(token);
       return ctx.fail(res, 'Срок действия рекламной сессии истёк.');
     }
@@ -2875,21 +3108,28 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     const done = req.body?.done === true;
     const hasError = req.body?.error === true;
     if (!sdkCompleted || !done || hasError) {
+      const errMsg = String(req.body?.description || 'Реклама Adsgram не была досмотрена до конца (показ не подтверждён).');
+      getMemBlockCounter(s.blockKey).errors += 1;
+      bumpErrorReason(errMsg);
+      pushAdEvent(ctx, { type: 'error', blockKey: s.blockKey, blockId: s.blockId, actorKey: s.actorKey, tgId: s.tgId, durationMs, detail: errMsg });
       adSessions.delete(token);
-      return ctx.fail(
-        res,
-        String(req.body?.description || 'Реклама Adsgram не была досмотрена до конца (показ не подтверждён).')
-      );
+      return ctx.fail(res, errMsg);
     }
 
-    const elapsedMs = now - s.startedAt;
-    if (elapsedMs < s.minWatchMs) {
+    if (durationMs < s.minWatchMs) {
+      const fastMsg = `Слишком быстрое завершение (${durationMs} мс < ${s.minWatchMs} мс)`;
+      getMemBlockCounter(s.blockKey).errors += 1;
+      bumpErrorReason('Слишком быстрое завершение показа');
+      pushAdEvent(ctx, { type: 'error', blockKey: s.blockKey, blockId: s.blockId, actorKey: s.actorKey, tgId: s.tgId, durationMs, detail: fastMsg });
       adSessions.delete(token);
       return ctx.fail(res, 'Слишком быстрое завершение показа — реклама не была просмотрена полностью.');
     }
 
     const clicked = req.body?.clicked === true;
     if (s.requiresClick && !clicked) {
+      getMemBlockCounter(s.blockKey).errors += 1;
+      bumpErrorReason('Не завершён клик/показ рекламного предложения');
+      pushAdEvent(ctx, { type: 'error', blockKey: s.blockKey, blockId: s.blockId, actorKey: s.actorKey, tgId: s.tgId, durationMs, detail: 'Не завершён обязательный показ/клик' });
       adSessions.delete(token);
       return ctx.fail(res, 'Необходимо полностью завершить показ рекламного предложения.');
     }
@@ -2904,6 +3144,9 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
         }
       }
       if (!s2sOk) {
+        getMemBlockCounter(s.blockKey).errors += 1;
+        bumpErrorReason('S2S Reward callback от Adsgram не поступил за 3с');
+        pushAdEvent(ctx, { type: 's2s_fail', blockKey: s.blockKey, blockId: s.blockId, actorKey: s.actorKey, tgId: s.tgId, durationMs, detail: 'S2S Reward callback не поступил в течение 3 сек — просмотр отклонён строгим режимом' });
         adSessions.delete(token);
         return ctx.fail(
           res,
@@ -2915,6 +3158,19 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     s.clicked = clicked;
     s.verified = true;
     s.verifiedAt = Date.now();
+    getMemBlockCounter(s.blockKey).completed += 1;
+    const dbStat = ensureDbAdStat(db, s.blockKey);
+    dbStat.completed = Number(dbStat.completed || 0) + 1;
+    dbStat.lastAt = s.verifiedAt;
+    pushAdEvent(ctx, {
+      type: 'complete',
+      blockKey: s.blockKey,
+      blockId: s.blockId,
+      actorKey: s.actorKey,
+      tgId: s.tgId,
+      durationMs,
+      detail: `Просмотр подтверждён (${Math.round(durationMs / 100) / 10}с${s.s2sConfirmed ? ' · S2S OK' : ''})`,
+    });
     res.json({ ok: 1, adProof: token, blockKey: s.blockKey, clicked: s.clicked });
   });
 
@@ -2942,7 +3198,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     if (!tgId) {
       return res.status(400).json({ ok: 0, error: 'Missing userid' });
     }
-    recordSdkS2SReward(tgId, blockId);
+    recordSdkS2SReward(tgId, blockId, ctx);
     return res.json({ ok: 1, recorded: true });
   };
 
@@ -3030,6 +3286,22 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
       date: nowIso,
     });
     st.history = st.history.slice(0, 30);
+
+    const dbStat = ensureDbAdStat(db, 'rfs_bonus');
+    dbStat.approved = Number(dbStat.approved || 0) + 1;
+    dbStat.eur = Number(dbStat.eur || 0) + reward;
+    dbStat.lastAt = Date.now();
+
+    pushAdEvent(ctx, {
+      type: 'credit',
+      blockKey: 'rfs_bonus',
+      blockId: getAdsgramBlocks(db).rfs_bonus || 'rfs_bonus',
+      actorKey: `club:${req.tid}`,
+      detail: isActivation
+        ? `Активирован бонус от РФС: +€${reward.toLocaleString('ru-RU')}`
+        : `Бонусная реклама РФС #${st.rfsExtraViews}: +€${reward.toLocaleString('ru-RU')}`,
+      eur: reward,
+    });
 
     ctx.save();
     res.json({
@@ -3763,5 +4035,518 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
     prop.votes = prop.voters.length;
     ctx.save();
     res.json({ ok: 1, votes: prop.votes, message: `Голос за матч со сборной «${prop.opponent}» учтён!` });
+  });
+
+  // ─── Admin Ads Publisher Cabinet & Telemetry ─────────────────────────────────
+  app.get('/api/admin/ads/dashboard', ctx.admin, (req, res) => {
+    pruneAdSessions();
+    const db = ctx.getDb();
+    const now = Date.now();
+    const blocks = getAdsgramBlocks(db);
+    const teams: any[] = Array.isArray(db.teams) ? db.teams : [];
+    const budgetHistory: any[] = Array.isArray(db.budgetHistory) ? db.budgetHistory : [];
+
+    // Aggregate historical sponsor & RFS payouts from budgetHistory
+    const spEurByBlock: Record<string, { approved: number; eur: number; lastAt: number }> = {
+      sponsor_long: { approved: 0, eur: 0, lastAt: 0 },
+      sponsor_short: { approved: 0, eur: 0, lastAt: 0 },
+      sponsor_banner: { approved: 0, eur: 0, lastAt: 0 },
+      rfs_bonus: { approved: 0, eur: 0, lastAt: 0 },
+    };
+    const clubHistoryMap: Record<string, { eur: number; count: number; lastAt: number }> = {};
+
+    for (const bh of budgetHistory) {
+      if (!bh || (bh.type !== 'sponsor_ad' && bh.type !== 'rfs_bonus_ad')) continue;
+      const amt = Number(bh.amount || 0);
+      const ts = bh.date ? new Date(bh.date).getTime() || 0 : 0;
+      const tid = String(bh.teamId || '');
+      if (tid) {
+        if (!clubHistoryMap[tid]) clubHistoryMap[tid] = { eur: 0, count: 0, lastAt: 0 };
+        clubHistoryMap[tid].eur += amt;
+        clubHistoryMap[tid].count += 1;
+        if (ts > clubHistoryMap[tid].lastAt) clubHistoryMap[tid].lastAt = ts;
+      }
+      let bKey = 'sponsor_long';
+      if (bh.type === 'rfs_bonus_ad') {
+        bKey = 'rfs_bonus';
+      } else {
+        const lbl = String(bh.typeLabel || bh.description || '');
+        if (lbl.includes('Т-Банк')) bKey = 'sponsor_short';
+        else if (lbl.includes('Аэрофлот')) bKey = 'sponsor_banner';
+        else bKey = 'sponsor_long';
+      }
+      spEurByBlock[bKey].approved += 1;
+      spEurByBlock[bKey].eur += amt;
+      if (ts > spEurByBlock[bKey].lastAt) spEurByBlock[bKey].lastAt = ts;
+    }
+
+    // Current active cycle sums
+    const sponsorCycles = db.sponsorCycles && typeof db.sponsorCycles === 'object' ? db.sponsorCycles : {};
+    const cycleDeclinedByBlock: Record<string, number> = { sponsor_long: 0, sponsor_short: 0, sponsor_banner: 0 };
+    for (const st of Object.values(sponsorCycles) as any[]) {
+      if (!st || typeof st !== 'object') continue;
+      cycleDeclinedByBlock.sponsor_long += Number(st.declined?.gazprom_neft || 0);
+      cycleDeclinedByBlock.sponsor_short += Number(st.declined?.tbank || 0);
+      cycleDeclinedByBlock.sponsor_banner += Number(st.declined?.aeroflot || 0);
+    }
+
+    // Friendly requests count
+    const friendlyAdUsage = db.friendlyAdUsage && typeof db.friendlyAdUsage === 'object' ? db.friendlyAdUsage : {};
+    const friendlyByTeam: Record<string, number> = {};
+    let totalFriendlyBackfill = 0;
+    for (const [tid, rec] of Object.entries(friendlyAdUsage) as any[]) {
+      if (!rec || typeof rec !== 'object') continue;
+      let tSum = 0;
+      for (const v of Object.values(rec)) tSum += Number(v || 0);
+      friendlyByTeam[tid] = tSum;
+      totalFriendlyBackfill += tSum;
+    }
+
+    // Friendly accepted count (approximate from friendlyRequests accepted/done)
+    const totalFriendlyAcceptedBackfill = Array.isArray(db.friendlyRequests)
+      ? db.friendlyRequests.filter((r: any) => r.status === 'accepted' || r.status === 'done').length
+      : 0;
+
+    // Interview usage backfill
+    const interviewUsage = db.interviewUsage && typeof db.interviewUsage === 'object' ? db.interviewUsage : {};
+    let totalInterviewBackfill = 0;
+    for (const matchRec of Object.values(interviewUsage) as any[]) {
+      if (!matchRec || typeof matchRec !== 'object') continue;
+      for (const actorRec of Object.values(matchRec) as any[]) {
+        totalInterviewBackfill += Number(actorRec?.count || 0);
+      }
+    }
+
+    // National proposals/votes backfill
+    const ntAllSets = [
+      ...(db.nationalTeam?.current ? [db.nationalTeam.current] : []),
+      ...(Array.isArray(db.nationalTeam?.archive) ? db.nationalTeam.archive : []),
+    ];
+    let ntPropPl = 0, ntVotePl = 0, ntPropOpp = 0, ntVoteOpp = 0;
+    for (const ntItem of ntAllSets) {
+      const pp = Array.isArray(ntItem.playerProposals) ? ntItem.playerProposals : [];
+      const op = Array.isArray(ntItem.opponentProposals) ? ntItem.opponentProposals : [];
+      ntPropPl += pp.length;
+      for (const x of pp) ntVotePl += Math.max(0, Number(x.votes || (Array.isArray(x.voters) ? x.voters.length : 1)) - 1);
+      ntPropOpp += op.length;
+      for (const x of op) ntVoteOpp += Math.max(0, Number(x.votes || (Array.isArray(x.voters) ? x.voters.length : 1)) - 1);
+    }
+
+    // Prediction wallets stats
+    const walletsObj = db.predictionWallets && typeof db.predictionWallets === 'object' ? db.predictionWallets : {};
+    let totalCoinsInCirculation = 0;
+    let totalCoinsEarnedOverStarter = 0;
+    let totalWalletCycleShort = 0, totalWalletCycleBanner = 0, totalWalletCycleLong = 0;
+    const walletsTable = Object.entries(walletsObj).map(([actorKey, rawW]: [string, any]) => {
+      const w = rawW || {};
+      const coins = roundCoins(Number(w.coins || 0));
+      const earnedTotal = roundCoins(Number(w.totalEarnedCoins || 0));
+      const cycleValid = !(w.cycleStartedAt > 0 && now - w.cycleStartedAt >= CYCLE_MS);
+      const cShort = cycleValid ? Number(w.adCounts?.coins_short || 0) : 0;
+      const cBanner = cycleValid ? Number(w.adCounts?.coins_banner || 0) : 0;
+      const cLong = cycleValid ? Number(w.adCounts?.coins_long || 0) : 0;
+      totalCoinsInCirculation += coins;
+      totalCoinsEarnedOverStarter += Math.max(0, earnedTotal - STARTER_COINS);
+      totalWalletCycleShort += cShort;
+      totalWalletCycleBanner += cBanner;
+      totalWalletCycleLong += cLong;
+
+      const prof = db.ownerProfiles?.[actorKey] || {};
+      const tgKey = actorKey.startsWith('user:tg_') ? actorKey.slice(5) : prof.telegramId ? `tg_${prof.telegramId}` : '';
+      const tgRec = tgKey ? db.telegramUsers?.[tgKey] : null;
+      const teamId = actorKey.startsWith('club:') ? actorKey.slice(5) : (prof.teamId || null);
+      const t = teamId ? ctx.team(teamId) : null;
+      const lastAdTimes = Object.values(w.lastAdAt || {}).map((x: any) => Number(x || 0)).filter(Boolean);
+      const lastAdAt = lastAdTimes.length ? Math.max(...lastAdTimes) : 0;
+
+      return {
+        actorKey,
+        displayName: prof.displayName || tgRec?.displayName || (t ? t.name : actorKey),
+        profileKind: prof.profileKind || (actorKey.startsWith('club:') ? 'owner' : actorKey.startsWith('admin:') ? 'admin' : 'spectator'),
+        tgId: prof.telegramId || tgRec?.tgId || '',
+        telegramUsername: prof.telegramUsername || tgRec?.username || '',
+        photoUrl: prof.photoUrl || tgRec?.photoUrl || '',
+        teamName: t?.name || '',
+        teamLogo: t ? ctx.teamLogo(t.id) : '',
+        coins,
+        totalEarnedCoins: earnedTotal,
+        earnedAdEst: Math.max(0, earnedTotal - STARTER_COINS),
+        cycleShort: cShort,
+        cycleBanner: cBanner,
+        cycleLong: cLong,
+        cycleTotal: cShort + cBanner + cLong,
+        resetAt: cycleValid && w.cycleStartedAt ? w.cycleStartedAt + CYCLE_MS : null,
+        lastAdAt,
+      };
+    }).sort((a, b) => b.totalEarnedCoins - a.totalEarnedCoins || b.coins - a.coins);
+
+    // Reward label helper
+    const rewardLabelOf = (key: string) => {
+      switch (key) {
+        case 'sponsor_long': return '+€750 (95%)';
+        case 'sponsor_short': return '+€500 (95%)';
+        case 'sponsor_banner': return '+€250 (95%)';
+        case 'rfs_bonus': return '+€1 000';
+        case 'friendly_request': return 'Заявка (9/пауза)';
+        case 'friendly_accept': return 'Приём заявки';
+        case 'coins_short': return '+1 монета';
+        case 'coins_banner': return '+2 монеты';
+        case 'coins_long': return '+3 монеты';
+        case 'nt_propose_player': return 'Игрок в сборную';
+        case 'nt_vote_player': return '+1 голос игроку';
+        case 'nt_propose_opp': return 'Соперник сборной';
+        case 'nt_vote_opp': return '+1 голос сопернику';
+        case 'interview_ask': return 'Вопрос игроку (5/матч)';
+        default: return '—';
+      }
+    };
+
+    const getSdkType = (blockId: string): 'reward' | 'interstitial' | 'task' => {
+      const low = String(blockId || '').toLowerCase();
+      if (low.startsWith('task-')) return 'task';
+      if (low.startsWith('int-')) return 'interstitial';
+      return 'reward';
+    };
+
+    const persistedStats = db.adStats && typeof db.adStats === 'object' ? db.adStats : {};
+    const taskBlockIdSet = new Set<string>();
+
+    let kpiCompleted = 0;
+    let kpiStartedSession = 0;
+    let kpiCompletedSession = 0;
+    let kpiErrorsSession = 0;
+    let kpiCancelsSession = 0;
+    let kpiS2sReceived = 0;
+    let kpiS2sMatched = 0;
+    let kpiTotalCoinsFromDb = 0;
+
+    const formatAgg: Record<'reward' | 'interstitial' | 'task', {
+      blocks: number;
+      configured: number;
+      completed: number;
+      startedSession: number;
+      completedSession: number;
+      errorsSession: number;
+    }> = {
+      reward: { blocks: 0, configured: 0, completed: 0, startedSession: 0, completedSession: 0, errorsSession: 0 },
+      interstitial: { blocks: 0, configured: 0, completed: 0, startedSession: 0, completedSession: 0, errorsSession: 0 },
+      task: { blocks: 0, configured: 0, completed: 0, startedSession: 0, completedSession: 0, errorsSession: 0 },
+    };
+
+    const blocksTable = ADSGRAM_BLOCKS.map((def) => {
+      const blockId = String(blocks[def.key] || '').trim();
+      const configured = isConfiguredAdsgramBlockId(def, blockId);
+      const sdkType = getSdkType(blockId);
+      if (sdkType === 'task' && configured) taskBlockIdSet.add(blockId.toLowerCase());
+
+      const mem = getMemBlockCounter(def.key);
+      const st = persistedStats[def.key] || {};
+
+      let histCompleted = Number(st.completed || 0);
+      let histEur = Number(st.eur || 0);
+      let histCoins = Number(st.coins || 0);
+      let approvedCount = Number(st.approved || 0);
+      let declinedCount = Number(st.declined || 0);
+
+      if (def.key === 'sponsor_long' || def.key === 'sponsor_short' || def.key === 'sponsor_banner' || def.key === 'rfs_bonus') {
+        const spHist = spEurByBlock[def.key];
+        approvedCount = Math.max(approvedCount, spHist.approved);
+        histEur = Math.max(histEur, spHist.eur);
+        declinedCount = Math.max(declinedCount, cycleDeclinedByBlock[def.key] || 0);
+        histCompleted = Math.max(histCompleted, approvedCount + declinedCount);
+      } else if (def.key === 'friendly_request') {
+        histCompleted = Math.max(histCompleted, totalFriendlyBackfill);
+      } else if (def.key === 'friendly_accept') {
+        histCompleted = Math.max(histCompleted, totalFriendlyAcceptedBackfill);
+      } else if (def.key === 'interview_ask') {
+        histCompleted = Math.max(histCompleted, totalInterviewBackfill);
+      } else if (def.key === 'nt_propose_player') {
+        histCompleted = Math.max(histCompleted, ntPropPl);
+      } else if (def.key === 'nt_vote_player') {
+        histCompleted = Math.max(histCompleted, ntVotePl);
+      } else if (def.key === 'nt_propose_opp') {
+        histCompleted = Math.max(histCompleted, ntPropOpp);
+      } else if (def.key === 'nt_vote_opp') {
+        histCompleted = Math.max(histCompleted, ntVoteOpp);
+      } else if (def.key === 'coins_short') {
+        histCompleted = Math.max(histCompleted, totalWalletCycleShort);
+        histCoins = Math.max(histCoins, totalWalletCycleShort * 1);
+      } else if (def.key === 'coins_banner') {
+        histCompleted = Math.max(histCompleted, totalWalletCycleBanner);
+        histCoins = Math.max(histCoins, totalWalletCycleBanner * 2);
+      } else if (def.key === 'coins_long') {
+        histCompleted = Math.max(histCompleted, totalWalletCycleLong);
+        histCoins = Math.max(histCoins, totalWalletCycleLong * 3);
+      }
+
+      histCompleted = Math.max(histCompleted, mem.completed);
+
+      kpiCompleted += histCompleted;
+      kpiStartedSession += mem.started;
+      kpiCompletedSession += mem.completed;
+      kpiErrorsSession += mem.errors;
+      kpiCancelsSession += mem.cancels;
+      kpiS2sReceived += mem.s2sReceived;
+      kpiS2sMatched += mem.s2sMatched;
+      kpiTotalCoinsFromDb += histCoins;
+
+      const fa = formatAgg[sdkType];
+      fa.blocks += 1;
+      if (configured) fa.configured += 1;
+      fa.completed += histCompleted;
+      fa.startedSession += mem.started;
+      fa.completedSession += mem.completed;
+      fa.errorsSession += mem.errors;
+
+      const lastAt = Math.max(
+        Number(st.lastAt || 0),
+        spEurByBlock[def.key]?.lastAt || 0
+      );
+
+      return {
+        key: def.key,
+        label: def.label,
+        category: def.category,
+        format: def.format,
+        sdkType,
+        durationSec: def.durationSec,
+        requiresClick: def.requiresClick,
+        maxPerCycle: def.maxPerCycle,
+        rewardLabel: rewardLabelOf(def.key),
+        blockId,
+        defaultBlockId: def.defaultBlockId,
+        configured,
+        completed: histCompleted,
+        approvedCount,
+        declinedCount,
+        eur: histEur,
+        coins: histCoins,
+        sessionStarted: mem.started,
+        sessionCompleted: mem.completed,
+        sessionErrors: mem.errors,
+        sessionCancels: mem.cancels,
+        s2sReceived: mem.s2sReceived,
+        conversionPct: mem.started > 0 ? Math.round((mem.completed / mem.started) * 100) : null,
+        lastAt,
+      };
+    });
+
+    const unkMem = memAdCounters['__unknown__'];
+    if (unkMem) {
+      kpiErrorsSession += unkMem.errors;
+      kpiCancelsSession += unkMem.cancels;
+      kpiS2sReceived += unkMem.s2sReceived;
+      kpiS2sMatched += unkMem.s2sMatched;
+    }
+
+    // Clubs table
+    let totalEurCycle = 0;
+    let activeClubsInCycleCount = 0;
+    const clubsTable = teams
+      .filter((t) => t && !t.archived)
+      .map((t) => {
+        const rawSt = sponsorCycles[t.id] || {};
+        const cycleValid = rawSt.cycleStartedAt > 0 && now - rawSt.cycleStartedAt < CYCLE_MS;
+        const resetAt = cycleValid ? rawSt.cycleStartedAt + CYCLE_MS : null;
+        const remainingMs = resetAt ? Math.max(0, resetAt - now) : 0;
+
+        const gViews = cycleValid ? Math.min(10, Number(rawSt.views?.gazprom_neft || 0)) : 0;
+        const tViews = cycleValid ? Math.min(10, Number(rawSt.views?.tbank || 0)) : 0;
+        const aViews = cycleValid ? Math.min(10, Number(rawSt.views?.aeroflot || 0)) : 0;
+        const totalViewsCycle = gViews + tViews + aViews;
+        const earnedEurCycle = cycleValid ? Number(rawSt.earnedEur || 0) : 0;
+        const rfsEarnedEurCycle = cycleValid ? Number(rawSt.rfsEarnedEur || 0) : 0;
+        const rfsExtraViews = cycleValid ? Number(rawSt.rfsExtraViews || 0) : 0;
+        const rfsClaimed = cycleValid && !!rawSt.rfsClaimed;
+        const rfsUnlocked = cycleValid && totalViewsCycle >= RFS_REQUIRED_VIEWS;
+
+        if (cycleValid && totalViewsCycle > 0) activeClubsInCycleCount += 1;
+        totalEurCycle += earnedEurCycle + rfsEarnedEurCycle;
+
+        const cdList = cycleValid
+          ? [
+              getCooldownLeftMs(rawSt.lastAdAt?.gazprom_neft),
+              getCooldownLeftMs(rawSt.lastAdAt?.tbank),
+              getCooldownLeftMs(rawSt.lastAdAt?.aeroflot),
+              getCooldownLeftMs(rawSt.lastAdAt?.rfs),
+            ]
+          : [];
+        const activeCooldownMs = cdList.length ? Math.max(0, ...cdList) : 0;
+        const lastTimes = Object.values(rawSt.lastAdAt || {}).map((x: any) => Number(x || 0)).filter(Boolean);
+        const hist = clubHistoryMap[t.id] || { eur: 0, count: 0, lastAt: 0 };
+        const lastAdAt = Math.max(hist.lastAt, lastTimes.length ? Math.max(...lastTimes) : 0);
+
+        return {
+          teamId: t.id,
+          name: t.name,
+          comp: t.comp,
+          compName: ctx.compName(t.comp || 'rpl'),
+          logo: ctx.teamLogo(t.id),
+          budget: Number(t.budget || 0),
+          cycleActive: cycleValid,
+          resetAt,
+          remainingMs,
+          gazpromViews: gViews,
+          gazpromApproved: cycleValid ? Number(rawSt.approved?.gazprom_neft || 0) : 0,
+          gazpromDeclined: cycleValid ? Number(rawSt.declined?.gazprom_neft || 0) : 0,
+          tbankViews: tViews,
+          tbankApproved: cycleValid ? Number(rawSt.approved?.tbank || 0) : 0,
+          tbankDeclined: cycleValid ? Number(rawSt.declined?.tbank || 0) : 0,
+          aeroflotViews: aViews,
+          aeroflotApproved: cycleValid ? Number(rawSt.approved?.aeroflot || 0) : 0,
+          aeroflotDeclined: cycleValid ? Number(rawSt.declined?.aeroflot || 0) : 0,
+          totalViewsCycle,
+          rfsUnlocked,
+          rfsClaimed,
+          rfsExtraViews,
+          earnedEurCycle,
+          rfsEarnedEurCycle,
+          activeCooldownMs,
+          friendlyAdsTotal: friendlyByTeam[t.id] || 0,
+          allTimeAdEur: Math.max(hist.eur, earnedEurCycle + rfsEarnedEurCycle),
+          allTimeAdTxCount: hist.count,
+          lastAdAt,
+        };
+      })
+      .sort((a, b) =>
+        b.allTimeAdEur - a.allTimeAdEur ||
+        (b.earnedEurCycle + b.rfsEarnedEurCycle) - (a.earnedEurCycle + a.rfsEarnedEurCycle) ||
+        b.totalViewsCycle - a.totalViewsCycle ||
+        b.friendlyAdsTotal - a.friendlyAdsTotal ||
+        a.name.localeCompare(b.name, 'ru')
+      );
+
+    const sponsorsBreakdown = [
+      ...SPONSORS.map((sp) => {
+        const bt = blocksTable.find((x) => x.key === sp.blockKey);
+        return {
+          id: sp.id,
+          name: sp.name,
+          blockKey: sp.blockKey,
+          blockId: bt?.blockId || blocks[sp.blockKey],
+          rewardEur: sp.rewardEur,
+          accentColor: sp.accentColor,
+          approved: bt?.approvedCount || 0,
+          declined: bt?.declinedCount || 0,
+          eur: bt?.eur || 0,
+          lastAt: bt?.lastAt || 0,
+        };
+      }),
+      (() => {
+        const bt = blocksTable.find((x) => x.key === 'rfs_bonus');
+        return {
+          id: 'rfs',
+          name: 'Бонус от РФС',
+          blockKey: 'rfs_bonus',
+          blockId: bt?.blockId || blocks.rfs_bonus,
+          rewardEur: 1000,
+          accentColor: '#15803d',
+          approved: bt?.approvedCount || 0,
+          declined: 0,
+          eur: bt?.eur || 0,
+          lastAt: bt?.lastAt || 0,
+        };
+      })(),
+    ];
+
+    const totalEurAllTime = sponsorsBreakdown.reduce((sum, x) => sum + Number(x.eur || 0), 0);
+    const totalSponsorApprovals = sponsorsBreakdown.reduce((sum, x) => sum + Number(x.approved || 0), 0);
+    const totalSponsorDeclines = sponsorsBreakdown.reduce((sum, x) => sum + Number(x.declined || 0), 0);
+
+    const activeSessions = Array.from(adSessions.values())
+      .filter((s) => !s.consumed && now - s.startedAt <= 15 * 60 * 1000)
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .map((s) => ({
+        tokenTail: s.token.slice(-6),
+        blockKey: s.blockKey,
+        blockId: s.blockId,
+        actorKey: s.actorKey,
+        actorLabel: resolveActorLabelForLog(ctx, s.actorKey, s.tgId),
+        tgId: s.tgId,
+        startedAt: s.startedAt,
+        elapsedSec: Math.round((now - s.startedAt) / 1000),
+        verified: s.verified,
+        s2sConfirmed: !!s.s2sConfirmed,
+      }));
+
+    const topErrorReasons = Object.entries(errorReasonCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([reason, count]) => ({ reason, count }));
+
+    const baseUrl = String(ctx.getSiteUrl?.() || db.settings?.siteUrl || '').trim().replace(/\/+$/, '');
+    const sdkRewardUrl = baseUrl ? `${baseUrl}/api/ads/sdk-reward?userid=[userId]` : '/api/ads/sdk-reward?userid=[userId]';
+
+    res.json({
+      generatedAt: now,
+      config: {
+        blocks,
+        defs: ADSGRAM_BLOCKS,
+        requireAdsgramS2S: !!db.settings?.requireAdsgramS2S,
+        sdkRewardUrl,
+        uniqueTaskIds: Array.from(taskBlockIdSet),
+      },
+      kpis: {
+        totalCompleted: kpiCompleted,
+        totalStartedSession: kpiStartedSession,
+        totalCompletedSession: kpiCompletedSession,
+        totalErrorsSession: kpiErrorsSession,
+        totalCancelsSession: kpiCancelsSession,
+        completionRatePct: kpiStartedSession > 0 ? Math.round((kpiCompletedSession / kpiStartedSession) * 100) : null,
+        totalEurAllTime,
+        totalEurCycle,
+        totalSponsorApprovals,
+        totalSponsorDeclines,
+        totalCoinsIssuedByAds: Math.max(kpiTotalCoinsFromDb, Math.round(totalCoinsEarnedOverStarter)),
+        totalCoinsInCirculation: roundCoins(totalCoinsInCirculation),
+        totalWallets: walletsTable.length,
+        s2sReceivedSession: kpiS2sReceived,
+        s2sMatchedSession: kpiS2sMatched,
+        activeSessionsCount: activeSessions.length,
+        activeClubsInCycleCount,
+      },
+      formatStats: formatAgg,
+      blocksTable,
+      sponsorsBreakdown,
+      clubsTable,
+      walletsTable: walletsTable.slice(0, 120),
+      activeSessions,
+      recentS2S: [...recentSdkS2SRewards].slice(-60).reverse(),
+      recentEvents: recentAdEvents.slice(0, 150),
+      topErrorReasons,
+    });
+  });
+
+  app.post('/api/admin/ads/settings', ctx.admin, (req: any, res) => {
+    const db = ctx.getDb();
+    db.settings ||= {};
+    const b = req.body || {};
+    if (b.adsgramBlocks && typeof b.adsgramBlocks === 'object') {
+      db.settings.adsgramBlocks ||= {};
+      for (const def of ADSGRAM_BLOCKS) {
+        if (typeof b.adsgramBlocks[def.key] === 'string') {
+          const val = b.adsgramBlocks[def.key].trim().slice(0, 100);
+          if (val) db.settings.adsgramBlocks[def.key] = val;
+        }
+      }
+    }
+    if (b.requireAdsgramS2S !== undefined) {
+      db.settings.requireAdsgramS2S = !!b.requireAdsgramS2S;
+    }
+    ctx.save();
+    res.json({
+      ok: 1,
+      adsgramBlocks: getAdsgramBlocks(db),
+      requireAdsgramS2S: !!db.settings.requireAdsgramS2S,
+      message: 'Настройки рекламных блоков Adsgram сохранены',
+    });
+  });
+
+  app.post('/api/admin/ads/clear-logs', ctx.admin, (_req, res) => {
+    recentAdEvents.length = 0;
+    recentSdkS2SRewards.length = 0;
+    for (const k of Object.keys(memAdCounters)) delete memAdCounters[k];
+    for (const k of Object.keys(errorReasonCounts)) delete errorReasonCounts[k];
+    res.json({ ok: 1, message: 'Журнал рекламных событий и диагностика сессии очищены' });
   });
 }
